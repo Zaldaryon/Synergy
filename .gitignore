@@ -1,0 +1,10 @@
+bin/
+obj/
+/nul
+nul
+*.user
+*.suo
+.vs/
+*.DotSettings.user
+build_output.txt
+package-lock.json
