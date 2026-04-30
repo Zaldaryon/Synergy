@@ -1,4 +1,5 @@
 using System;
+using System.Runtime;
 using HarmonyLib;
 using Synergy.Server;
 using Vintagestory.API.Client;
@@ -32,6 +33,17 @@ namespace Synergy
             harmony = new Harmony(HarmonyId);
 
             sapi.Logger.Notification("[Synergy] Server-side initializing...");
+
+            // Runtime tuning — benefits the entire server process
+            if (Config.GcDiagnosticsEnabled)
+            {
+                LogGcDiagnostics(sapi);
+            }
+
+            if (Config.GcSustainedLowLatencyEnabled)
+            {
+                ApplyGcLatencyMode(sapi);
+            }
 
             int count = 0;
 
@@ -113,10 +125,51 @@ namespace Synergy
             command.Register();
         }
 
+        private GCLatencyMode previousLatencyMode;
+
+        private void ApplyGcLatencyMode(ICoreServerAPI sapi)
+        {
+            try
+            {
+                previousLatencyMode = GCSettings.LatencyMode;
+                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+                sapi.Logger.Notification("[Synergy] GC latency mode: {0} → SustainedLowLatency", previousLatencyMode);
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Warning("[Synergy] Could not set GC latency mode: {0}", ex.Message);
+            }
+        }
+
+        private static void LogGcDiagnostics(ICoreServerAPI sapi)
+        {
+            try
+            {
+                var info = GC.GetGCMemoryInfo();
+                sapi.Logger.Notification(
+                    "[Synergy] GC diagnostics — Server GC: {0}, Latency: {1}, Heap: {2:N0} MB, Committed: {3:N0} MB, Fragmented: {4:N0} MB",
+                    GCSettings.IsServerGC,
+                    GCSettings.LatencyMode,
+                    info.HeapSizeBytes / 1048576.0,
+                    info.TotalCommittedBytes / 1048576.0,
+                    info.FragmentedBytes / 1048576.0);
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Debug("[Synergy] GC diagnostics unavailable: {0}", ex.Message);
+            }
+        }
+
         public override void Dispose()
         {
             try
             {
+                // Restore GC latency mode
+                if (Config?.GcSustainedLowLatencyEnabled == true)
+                {
+                    GCSettings.LatencyMode = previousLatencyMode;
+                }
+
                 NetworkFlushConsolidation.Cleanup();
                 harmony?.UnpatchAll(HarmonyId);
             }

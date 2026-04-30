@@ -9,7 +9,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// P9: Skip full inventory iteration when nothing is dirty.
+    /// Skip full inventory iteration when nothing is dirty.
     /// Uses Volatile.Read/Write for thread-safe dirty flag.
     /// Vanilla behavior preserved: dirty slots still sent at same rate.
     /// </summary>
@@ -30,14 +30,14 @@ namespace Synergy.Server
             var targetType = AccessTools.TypeByName("Vintagestory.Server.ServerSystemInventory");
             if (targetType == null)
             {
-                api.Logger.Warning("[Synergy] P9: Could not find ServerSystemInventory, skipping");
+                api.Logger.Warning("[Synergy] InventoryScan: Could not find ServerSystemInventory, skipping");
                 return;
             }
 
             var sendDirtySlots = AccessTools.Method(targetType, "SendDirtySlots", new[] { typeof(float) });
             if (sendDirtySlots == null)
             {
-                api.Logger.Warning("[Synergy] P9: Could not find SendDirtySlots method, skipping");
+                api.Logger.Warning("[Synergy] InventoryScan: Could not find SendDirtySlots method, skipping");
                 return;
             }
 
@@ -55,7 +55,7 @@ namespace Synergy.Server
                     postfix: new HarmonyMethod(typeof(InventoryDirtyScan), nameof(Postfix_DidModifyItemSlot)));
             }
 
-            api.Logger.Notification("[Synergy] P9: Inventory dirty scan optimization active");
+            api.Logger.Notification("[Synergy] InventoryScan: Inventory dirty scan optimization active");
         }
 
         public static void Postfix_DidModifyItemSlot()
@@ -81,7 +81,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P9: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] InventoryScan: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

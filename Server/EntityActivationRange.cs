@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -10,7 +9,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// P11: Skip OnGameTick for non-player entities beyond activation range.
+    /// Skip OnGameTick for non-player entities beyond activation range.
     /// Uses entity.NearestPlayerDistance (already computed by PhysicsManager).
     /// Whitelisted behaviors (breathe, health, despawn, decay) still tick for sleeping entities.
     /// Calendar-based behaviors (growth, breeding, harvestable) catch up automatically.
@@ -23,14 +22,13 @@ namespace Synergy.Server
         private static bool disabled;
         private static float activationRange = 48f;
 
-        // Cached reflection — resolved once at init
-        private static MethodInfo despawnMethod;
-        private static FieldInfo frameProfilerField;
-        private static FieldInfo loadedEntitiesField;
-        private static FieldInfo serverApiField;
-        private static MethodInfo profilerEnter;
-        private static MethodInfo profilerLeave;
-        private static MethodInfo profilerMark;
+        // IL-emitted fast accessors via Harmony
+        private delegate void FastDespawnDelegate(object server, Entity entity, EntityDespawnData data);
+        private static FastDespawnDelegate despawnFast;
+        private static AccessTools.FieldRef<object, IDictionary<long, Entity>> loadedEntitiesRef;
+
+        // FrameProfilerUtil is public — use StaticFieldRefAccess for the static field, then direct method calls
+        private static AccessTools.FieldRef<FrameProfilerUtil> frameProfilerRef;
 
         private static readonly HashSet<string> whitelistedBehaviors = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -54,44 +52,45 @@ namespace Synergy.Server
             var targetType = AccessTools.TypeByName("Vintagestory.Server.ServerSystemEntitySimulation");
             if (targetType == null)
             {
-                api.Logger.Warning("[Synergy] P11: Could not find ServerSystemEntitySimulation, skipping");
+                api.Logger.Warning("[Synergy] ActivationRange: Could not find ServerSystemEntitySimulation, skipping");
                 return;
             }
 
             var tickEntities = AccessTools.Method(targetType, "TickEntities", new[] { typeof(float) });
             if (tickEntities == null)
             {
-                api.Logger.Warning("[Synergy] P11: Could not find TickEntities method, skipping");
+                api.Logger.Warning("[Synergy] ActivationRange: Could not find TickEntities method, skipping");
                 return;
             }
 
-            // Cache despawn method on ServerMain
+            // Cache despawn delegate via DynamicMethod (skipVisibility:true bypasses
+            // Delegate.CreateDelegate limitation with internal types)
             var serverMainType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
             if (serverMainType != null)
             {
-                despawnMethod = AccessTools.Method(serverMainType, "DespawnEntity",
+                var despawnMethod = AccessTools.Method(serverMainType, "DespawnEntity",
                     new[] { typeof(Entity), typeof(EntityDespawnData) });
-            }
+                if (despawnMethod != null)
+                {
+                    var dm = new System.Reflection.Emit.DynamicMethod(
+                        "Synergy_FastDespawn", typeof(void),
+                        new[] { typeof(object), typeof(Entity), typeof(EntityDespawnData) },
+                        typeof(EntityActivationRange), skipVisibility: true);
+                    var il = dm.GetILGenerator();
+                    il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+                    il.Emit(System.Reflection.Emit.OpCodes.Castclass, serverMainType);
+                    il.Emit(System.Reflection.Emit.OpCodes.Ldarg_1);
+                    il.Emit(System.Reflection.Emit.OpCodes.Ldarg_2);
+                    il.Emit(System.Reflection.Emit.OpCodes.Callvirt, despawnMethod);
+                    il.Emit(System.Reflection.Emit.OpCodes.Ret);
+                    despawnFast = (FastDespawnDelegate)dm.CreateDelegate(typeof(FastDespawnDelegate));
+                }
 
-            // Cache FrameProfiler static field
-            if (serverMainType != null)
-            {
-                frameProfilerField = AccessTools.Field(serverMainType, "FrameProfiler");
-                loadedEntitiesField = AccessTools.Field(serverMainType, "LoadedEntities");
-            }
+                loadedEntitiesRef = AccessTools.FieldRefAccess<IDictionary<long, Entity>>(serverMainType, "LoadedEntities");
 
-            // Cache api field for world access
-            var serverApiType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
-            if (serverApiType != null)
-                serverApiField = AccessTools.Field(serverApiType, "api");
-
-            // Cache FrameProfiler methods
-            var profilerType = AccessTools.TypeByName("Vintagestory.API.Common.FrameProfilerUtil");
-            if (profilerType != null)
-            {
-                profilerEnter = AccessTools.Method(profilerType, "Enter", new[] { typeof(string) });
-                profilerLeave = AccessTools.Method(profilerType, "Leave");
-                profilerMark = AccessTools.Method(profilerType, "Mark", new[] { typeof(string), typeof(string) });
+                // FrameProfiler is public static FrameProfilerUtil on ServerMain
+                frameProfilerRef = AccessTools.StaticFieldRefAccess<FrameProfilerUtil>(
+                    AccessTools.Field(serverMainType, "FrameProfiler"));
             }
 
             if (!ConflictDetector.IsSafeToPatch(tickEntities, SynergyMod.HarmonyId, api.Logger))
@@ -100,7 +99,7 @@ namespace Synergy.Server
             harmony.Patch(tickEntities,
                 prefix: new HarmonyMethod(typeof(EntityActivationRange), nameof(Prefix_TickEntities)));
 
-            api.Logger.Notification("[Synergy] P11: Entity activation range optimization active (range: {0} blocks)", activationRange);
+            api.Logger.Notification("[Synergy] ActivationRange: Entity activation range optimization active (range: {0} blocks)", activationRange);
         }
 
         public static bool Prefix_TickEntities(float dt, object __instance, object ___server)
@@ -109,12 +108,12 @@ namespace Synergy.Server
 
             try
             {
-                var loadedEntities = loadedEntitiesField?.GetValue(___server) as IDictionary<long, Entity>;
+                var loadedEntities = loadedEntitiesRef?.Invoke(___server);
                 if (loadedEntities == null) return true;
 
-                // FrameProfiler — match vanilla's profiling calls
-                object profiler = frameProfilerField?.GetValue(null);
-                if (profiler != null) profilerEnter?.Invoke(profiler, new object[] { "tickentities" });
+                // FrameProfilerUtil is public — direct access, zero reflection
+                var profiler = frameProfilerRef?.Invoke();
+                profiler?.Enter("tickentities");
 
                 var despawnList = new List<KeyValuePair<Entity, EntityDespawnData>>();
 
@@ -137,10 +136,10 @@ namespace Synergy.Server
                     catch (Exception ex)
                     {
                         if (entity is EntityPlayer ep)
-                            sapi?.Logger.Warning("[Synergy] P11: Exception ticking player {0} ({1}) at {2}: {3}",
+                            sapi?.Logger.Warning("[Synergy] ActivationRange: Exception ticking player {0} ({1}) at {2}: {3}",
                                 ep.GetName(), ep.PlayerUID, ep.Pos, ex.Message);
                         else
-                            sapi?.Logger.Warning("[Synergy] P11: Exception ticking entity {0} ({1}) at {2}: {3}",
+                            sapi?.Logger.Warning("[Synergy] ActivationRange: Exception ticking entity {0} ({1}) at {2}: {3}",
                                 entity.GetName(), entity.Properties?.Class, entity.Pos, ex.Message);
                     }
 
@@ -148,17 +147,17 @@ namespace Synergy.Server
                         despawnList.Add(new KeyValuePair<Entity, EntityDespawnData>(entity, entity.DespawnReason));
                 }
 
-                if (profiler != null) profilerEnter?.Invoke(profiler, new object[] { "despawning" });
+                profiler?.Enter("despawning");
 
                 foreach (var kvp in despawnList)
                 {
-                    despawnMethod?.Invoke(___server, new object[] { kvp.Key, kvp.Value });
+                    despawnFast?.Invoke(___server, kvp.Key, kvp.Value);
 
-                    if (profiler != null) profilerMark?.Invoke(profiler, new object[] { "despawned-", kvp.Key.Code?.Path ?? "unknown" });
+                    profiler?.Mark("despawned-", kvp.Key.Code?.Path ?? "unknown");
                 }
 
-                if (profiler != null) profilerLeave?.Invoke(profiler, null);
-                if (profiler != null) profilerLeave?.Invoke(profiler, null);
+                profiler?.Leave();
+                profiler?.Leave();
 
                 return false;
             }
@@ -167,7 +166,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P11: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] ActivationRange: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }
@@ -208,7 +207,7 @@ namespace Synergy.Server
                     }
                     catch (Exception ex)
                     {
-                        sapi?.Logger.Debug("[Synergy] P11: Error in whitelisted behavior {0}: {1}", name, ex.Message);
+                        sapi?.Logger.Debug("[Synergy] ActivationRange: Error in whitelisted behavior {0}: {1}", name, ex.Message);
                     }
                 }
             }

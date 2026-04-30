@@ -55,8 +55,8 @@ resolve_vintagestory_data_root() {
         "${VINTAGESTORY_DATA:-}"
         "${XDG_CONFIG_HOME:-$HOME/.config}/VintagestoryData"
         "$HOME/.config/VintagestoryData"
-        "$HOME/AppData/Roaming/VintagestoryData"
-        "$HOME/AppData/Roaming/VintagestoryData"
+        "$HOME/.config/VintagestoryData"
+        "$HOME/.config/VintagestoryData"
     )
     first_existing_dir "${candidates[@]}"
 }

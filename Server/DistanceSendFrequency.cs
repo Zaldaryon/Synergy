@@ -9,7 +9,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// S2: Reduce position update rate for distant entities from 30Hz to 15Hz.
+    /// Reduce position update rate for distant entities from 30Hz to 15Hz.
     /// IsTracked==2 (≤50 blocks): every tick (30Hz). IsTracked==1 (50-128 blocks): every 2nd tick (15Hz).
     /// Fast entities (motion > threshold) always send at 30Hz regardless of distance.
     /// Uses a separate frame counter to avoid interfering with vanilla's tick attribute.
@@ -33,7 +33,7 @@ namespace Synergy.Server
             var physMgr = AccessTools.TypeByName("Vintagestory.Server.PhysicsManager");
             if (physMgr == null)
             {
-                api.Logger.Warning("[Synergy] S2: Could not find PhysicsManager, skipping");
+                api.Logger.Warning("[Synergy] SendFrequency: Could not find PhysicsManager, skipping");
                 return;
             }
 
@@ -43,7 +43,7 @@ namespace Synergy.Server
                 ?? AccessTools.TypeByName("Vintagestory.Server.AnimationPacket");
             if (pktType == null || animType == null)
             {
-                api.Logger.Warning("[Synergy] S2: Could not find packet types, skipping");
+                api.Logger.Warning("[Synergy] SendFrequency: Could not find packet types, skipping");
                 return;
             }
 
@@ -54,7 +54,7 @@ namespace Synergy.Server
                 new[] { typeof(Entity), typeof(bool), dictPosType, dictAnimType });
             if (buildPos == null)
             {
-                api.Logger.Warning("[Synergy] S2: Could not find BuildPositionPacket, skipping");
+                api.Logger.Warning("[Synergy] SendFrequency: Could not find BuildPositionPacket, skipping");
                 return;
             }
 
@@ -67,7 +67,7 @@ namespace Synergy.Server
             // Increment frame counter each server tick (atomic for thread safety)
             api.Event.RegisterGameTickListener(_ => Interlocked.Increment(ref frameCounter), 1);
 
-            api.Logger.Notification("[Synergy] S2: Distance-based send frequency active");
+            api.Logger.Notification("[Synergy] SendFrequency: Distance-based send frequency active");
         }
 
         public static bool Prefix_BuildPositionPacket(Entity entity, bool forceUpdate)
@@ -95,7 +95,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] S2: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] SendFrequency: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

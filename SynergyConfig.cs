@@ -22,6 +22,10 @@ namespace Synergy
         public bool AttributeSyncResyncPreventionEnabled { get; set; } = true;
         public bool EntitySpawnPriorityOrderingEnabled { get; set; } = true;
 
+        // Runtime tuning
+        public bool GcSustainedLowLatencyEnabled { get; set; } = true;
+        public bool GcDiagnosticsEnabled { get; set; } = true;
+
         public static SynergyConfig Load(ICoreAPI api)
         {
             try
