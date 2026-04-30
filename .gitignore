@@ -8,3 +8,4 @@ nul
 *.DotSettings.user
 build_output.txt
 package-lock.json
+.codex

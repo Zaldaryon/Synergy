@@ -10,10 +10,21 @@ namespace Synergy.Server
 {
     /// <summary>
     /// Reduce position update rate for distant entities from 30Hz to 15Hz.
+    /// Also suppress force-update position packets for truly stationary entities.
+    ///
+    /// Distance throttle:
     /// IsTracked==2 (≤50 blocks): every tick (30Hz). IsTracked==1 (50-128 blocks): every 2nd tick (15Hz).
     /// Fast entities (motion > threshold) always send at 30Hz regardless of distance.
-    /// Uses a separate frame counter to avoid interfering with vanilla's tick attribute.
+    ///
+    /// Stationary suppression:
+    /// Vanilla sends a force-update position packet every 30 ticks (~1s) even for entities that
+    /// haven't moved. This wastes ~100 bytes × entities/s per client. We skip the packet when
+    /// forceUpdate=true but position/angles/motion haven't changed since last send.
+    /// The tick counter only increments when a packet is actually created (vanilla behavior),
+    /// so client interpolation (tickDiff) remains correct.
+    ///
     /// Vanilla behavior preserved: interpolation handles variable rates via tickDiff.
+    /// CompletePositionUpdate still runs (it's called after BuildPositionPacket regardless).
     /// </summary>
     public static class DistanceSendFrequency
     {
@@ -22,6 +33,9 @@ namespace Synergy.Server
         private static bool disabled;
         private const double FastMotionThresholdSq = 0.04; // ~0.2 blocks/tick
         private static int frameCounter;
+
+        // Fast accessor for internal Entity.tagsDirty field
+        private static AccessTools.FieldRef<Entity, bool> tagsDirtyRef;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -61,6 +75,8 @@ namespace Synergy.Server
             if (!ConflictDetector.IsSafeToPatch(buildPos, SynergyMod.HarmonyId, api.Logger))
                 return;
 
+            tagsDirtyRef = AccessTools.FieldRefAccess<Entity, bool>("tagsDirty");
+
             harmony.Patch(buildPos,
                 prefix: new HarmonyMethod(typeof(DistanceSendFrequency), nameof(Prefix_BuildPositionPacket)));
 
@@ -72,11 +88,30 @@ namespace Synergy.Server
 
         public static bool Prefix_BuildPositionPacket(Entity entity, bool forceUpdate)
         {
-            if (disabled || forceUpdate) return true;
+            if (disabled) return true;
 
             try
             {
-                // Only throttle low-res tracked entities (50-128 blocks)
+                // Players handle their own position packets via ServerUdpNetwork
+                if (entity is EntityPlayer) return true;
+
+                // Stationary suppression: skip force-update when entity hasn't moved at all.
+                // The tick counter (GetIntAndIncrement) only runs when vanilla creates a packet,
+                // so skipping here keeps tick counters correct. CompletePositionUpdate runs
+                // regardless (it's called after BuildPositionPacket in vanilla).
+                if (forceUpdate)
+                {
+                    var agent = entity as EntityAgent;
+                    bool controlsDirty = agent != null && agent.Controls.Dirty;
+                    if (!controlsDirty && !(tagsDirtyRef?.Invoke(entity) ?? false) &&
+                        entity.Pos.BasicallySameAs(entity.PreviousServerPos))
+                    {
+                        return false;
+                    }
+                    return true;
+                }
+
+                // Distance throttle: only for distant tracked entities (50-128 blocks)
                 if (entity.IsTracked != 1) return true;
 
                 // Fast-moving entities always send

@@ -8,6 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
+- Current version: `1.1.3`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
@@ -30,7 +31,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 1. **Entity Activation Range** (`EntityActivationRangeEnabled`)
    - Patches `ServerSystemEntitySimulation.TickEntities(float)` — prefix (replaces method)
    - Skips `OnGameTick` for non-player entities beyond 48 blocks of any player
-   - Whitelisted behaviors still tick for sleeping entities: breathe, health, despawn, deaddecay, decay, grow, multiply, harvestable
+   - Whitelisted behaviors still tick for sleeping entities: breathe, health, timeddespawn, deaddecay, grow, multiply, harvestable
    - Calendar-based behaviors (grow, multiply, harvestable) catch up automatically via `Calendar.TotalHours`
    - Entities in lava or on fire always get full tick (fire/ignition/extinguishing logic preserved)
    - Players and `AlwaysActive` entities always get full tick
