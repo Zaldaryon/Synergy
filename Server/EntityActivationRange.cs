@@ -34,9 +34,8 @@ namespace Synergy.Server
         {
             "breathe",
             "health",
-            "despawn",
+            "timeddespawn",
             "deaddecay",
-            "decay",
             "grow",
             "multiply",
             "harvestable"
