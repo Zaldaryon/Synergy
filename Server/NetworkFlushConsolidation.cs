@@ -1,18 +1,27 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Server;
 
 namespace Synergy.Server
 {
     /// <summary>
-    /// P8: Batch small TCP packets into fewer network frames.
+    /// Batch small TCP packets into fewer network frames.
     /// Patches TcpNetConnection.Send to buffer small uncompressed packets,
-    /// then calls vanilla Send for each during flush (preserving header format and async path).
+    /// then flushes all buffers at end-of-tick via a postfix on ServerMain.Process().
     /// High-priority packets (compressed or large) flush immediately.
     /// Vanilla behavior preserved: same data sent, same header format, same async path.
+    ///
+    /// Design follows the industry-standard flush-at-end-of-tick pattern used by:
+    /// - Netty FlushConsolidationHandler (buffer during read, flush at channelReadComplete)
+    /// - Minecraft Paper (write during tick, single flush at end)
+    /// - Source Engine (collect state changes, send snapshot at end of tick)
+    /// - Gaffer on Games (send after simulation step completes)
+    ///
+    /// The VS server tick loop runs: Systems.OnServerTick → EventManager.TriggerGameTick → ProcessMain.
+    /// ProcessMain handles client packets (inventory moves, slot activations) which generate response
+    /// packets. A postfix on Process() ensures these are flushed in the same tick, not the next one.
     /// </summary>
     public static class NetworkFlushConsolidation
     {
@@ -22,13 +31,15 @@ namespace Synergy.Server
         private const int MtuThreshold = 1400;
 
         // Cached reflection
-        private static MethodInfo vanillaSendMethod;
-        private static FieldInfo connectedField;
         private static object enumOk;
 
-        [ThreadStatic] private static bool flushing;
+        // IL-emitted delegate via DynamicMethod (skipVisibility:true) — bypasses
+        // Delegate.CreateDelegate limitation with internal types. Near-native call speed.
+        private delegate void FastSendDelegate(object instance, byte[] data, bool compressed);
+        private static FastSendDelegate vanillaSendFast;
+        private static AccessTools.FieldRef<object, bool> connectedRef;
 
-        private static long tickListenerId;
+        [ThreadStatic] private static bool flushing;
 
         private static readonly ConcurrentDictionary<object, BufferState> connectionBuffers = new();
 
@@ -48,21 +59,37 @@ namespace Synergy.Server
             var tcpConnType = AccessTools.TypeByName("Vintagestory.Server.Network.TcpNetConnection");
             if (tcpConnType == null)
             {
-                api.Logger.Warning("[Synergy] P8: Could not find TcpNetConnection, skipping");
+                api.Logger.Warning("[Synergy] NetworkFlush: Could not find TcpNetConnection, skipping");
                 return;
             }
 
-            vanillaSendMethod = AccessTools.Method(tcpConnType, "Send",
+            // IL-emitted delegate via DynamicMethod — bypasses Delegate.CreateDelegate
+            // limitation with internal return types (EnumSendResult). skipVisibility:true
+            // allows calling methods on internal types from another assembly.
+            var vanillaSendMethod = AccessTools.Method(tcpConnType, "Send",
                 new[] { typeof(byte[]), typeof(bool) });
             if (vanillaSendMethod == null)
             {
-                api.Logger.Warning("[Synergy] P8: Could not find TcpNetConnection.Send, skipping");
+                api.Logger.Warning("[Synergy] NetworkFlush: Could not find TcpNetConnection.Send, skipping");
                 return;
             }
 
-            connectedField = AccessTools.Field(tcpConnType, "Connected");
+            var dm = new System.Reflection.Emit.DynamicMethod(
+                "Synergy_FastSend", typeof(void),
+                new[] { typeof(object), typeof(byte[]), typeof(bool) },
+                typeof(NetworkFlushConsolidation), skipVisibility: true);
+            var il = dm.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+            il.Emit(System.Reflection.Emit.OpCodes.Castclass, tcpConnType);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_1);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_2);
+            il.Emit(System.Reflection.Emit.OpCodes.Callvirt, vanillaSendMethod);
+            il.Emit(System.Reflection.Emit.OpCodes.Pop); // discard EnumSendResult
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+            vanillaSendFast = (FastSendDelegate)dm.CreateDelegate(typeof(FastSendDelegate));
 
-            // Resolve EnumSendResult.Ok — try both known namespaces
+            connectedRef = AccessTools.FieldRefAccess<bool>(tcpConnType, "Connected");
+
             var enumType = AccessTools.TypeByName("Vintagestory.Common.EnumSendResult")
                 ?? AccessTools.TypeByName("Vintagestory.Server.Network.EnumSendResult");
             if (enumType != null)
@@ -74,9 +101,25 @@ namespace Synergy.Server
             harmony.Patch(vanillaSendMethod,
                 prefix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Prefix_Send)));
 
-            tickListenerId = api.Event.RegisterGameTickListener(OnServerTick, 1);
+            // Flush at end-of-tick via postfix on ServerMain.Process()
+            // This ensures packets from ProcessMain (inventory interactions) are flushed
+            // in the same tick they're generated, not delayed to the next tick.
+            var serverMainType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
+            var processMethod = serverMainType != null
+                ? AccessTools.Method(serverMainType, "Process", Type.EmptyTypes)
+                : null;
 
-            api.Logger.Notification("[Synergy] P8: Network flush consolidation active");
+            if (processMethod != null &&
+                ConflictDetector.IsSafeToPatch(processMethod, SynergyMod.HarmonyId, api.Logger))
+            {
+                harmony.Patch(processMethod,
+                    postfix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Postfix_Process)));
+                api.Logger.Notification("[Synergy] NetworkFlush: Network flush consolidation active (end-of-tick flush)");
+            }
+            else
+            {
+                api.Logger.Warning("[Synergy] NetworkFlush: Could not patch ServerMain.Process, skipping");
+            }
         }
 
         public static bool Prefix_Send(object __instance, byte[] data, bool compressedFlag, ref object __result)
@@ -85,7 +128,6 @@ namespace Synergy.Server
 
             try
             {
-                // Large or compressed packets: flush pending then let vanilla handle this one
                 if (data.Length > MtuThreshold || compressedFlag)
                 {
                     FlushConnection(__instance);
@@ -113,13 +155,13 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P8: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] NetworkFlush: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }
         }
 
-        private static void OnServerTick(float dt)
+        public static void Postfix_Process()
         {
             if (disabled) return;
             FlushAll();
@@ -148,8 +190,7 @@ namespace Synergy.Server
 
             try
             {
-                // Check connection alive
-                if (connectedField != null && !(bool)connectedField.GetValue(connection))
+                if (connectedRef != null && !connectedRef(connection))
                 {
                     state.pendingPackets.Clear();
                     state.totalBytes = 0;
@@ -157,13 +198,12 @@ namespace Synergy.Server
                     return;
                 }
 
-                // Use ThreadStatic re-entry guard so other threads aren't affected
                 flushing = true;
                 try
                 {
                     foreach (var packet in state.pendingPackets)
                     {
-                        vanillaSendMethod.Invoke(connection, new object[] { packet, false });
+                        vanillaSendFast(connection, packet, false);
                     }
                 }
                 finally
@@ -173,7 +213,7 @@ namespace Synergy.Server
             }
             catch (Exception ex)
             {
-                sapi?.Logger.Debug("[Synergy] P8: Flush error: {0}", ex.Message);
+                sapi?.Logger.Debug("[Synergy] NetworkFlush: Flush error: {0}", ex.Message);
             }
             finally
             {
@@ -186,11 +226,6 @@ namespace Synergy.Server
         {
             FlushAll();
             connectionBuffers.Clear();
-            if (sapi != null && tickListenerId != 0)
-            {
-                sapi.Event.UnregisterGameTickListener(tickListenerId);
-                tickListenerId = 0;
-            }
         }
     }
 }

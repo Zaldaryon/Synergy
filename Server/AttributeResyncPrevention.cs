@@ -9,7 +9,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// S3: Convert RemoveAttribute() full resyncs into delta updates.
+    /// Convert RemoveAttribute() full resyncs into delta updates.
     /// Patches SyncedTreeAttribute.RemoveAttribute to call base.RemoveAttribute(key)
     /// then add the key to attributePathsDirty directly (avoiding MarkPathDirty's listener trigger,
     /// matching vanilla's MarkAllDirty which also does NOT trigger listeners).
@@ -39,7 +39,7 @@ namespace Synergy.Server
                 new[] { typeof(string) });
             if (removeAttr == null)
             {
-                api.Logger.Warning("[Synergy] S3: Could not find SyncedTreeAttribute.RemoveAttribute, skipping");
+                api.Logger.Warning("[Synergy] AttributeSync: Could not find SyncedTreeAttribute.RemoveAttribute, skipping");
                 return;
             }
 
@@ -58,14 +58,14 @@ namespace Synergy.Server
             }
             catch (Exception ex)
             {
-                api.Logger.Warning("[Synergy] S3: Reverse patch failed, skipping: {0}", ex.Message);
+                api.Logger.Warning("[Synergy] AttributeSync: Reverse patch failed, skipping: {0}", ex.Message);
                 return;
             }
 
             harmony.Patch(removeAttr,
                 prefix: new HarmonyMethod(typeof(AttributeResyncPrevention), nameof(Prefix_RemoveAttribute)));
 
-            api.Logger.Notification("[Synergy] S3: Attribute sync delta updates active");
+            api.Logger.Notification("[Synergy] AttributeSync: Attribute sync delta updates active");
         }
 
         /// <summary>
@@ -108,7 +108,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] S3: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] AttributeSync: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

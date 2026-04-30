@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -9,7 +8,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// S4: Sort entity spawns by distance so nearby entities appear first after teleport.
+    /// Sort entity spawns by distance so nearby entities appear first after teleport.
     /// Sends farthest-first because client uses LIFO stack (EntityLoadQueue is Stack&lt;Entity&gt;)
     /// — inversion means nearest entities are processed first on client.
     /// Vanilla behavior preserved: same entities spawn, just in better order.
@@ -20,11 +19,11 @@ namespace Synergy.Server
         private static int errorCount;
         private static bool disabled;
 
-        // Cached reflection
-        private static FieldInfo clientListField;
-        private static FieldInfo nowInRangeField;
-        private static FieldInfo playerField;
-        private static FieldInfo entityField;
+        // IL-emitted fast accessors via Harmony — FieldRef<object, F> for internal types
+        private static AccessTools.FieldRef<object, System.Collections.IList> clientListRef;
+        private static AccessTools.FieldRef<object, System.Collections.IList> nowInRangeRef;
+        private static AccessTools.FieldRef<object, IServerPlayer> playerRef;
+        private static AccessTools.FieldRef<object, Entity> entityRef;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -35,27 +34,27 @@ namespace Synergy.Server
             var physMgr = AccessTools.TypeByName("Vintagestory.Server.PhysicsManager");
             if (physMgr == null)
             {
-                api.Logger.Warning("[Synergy] S4: Could not find PhysicsManager, skipping");
+                api.Logger.Warning("[Synergy] SpawnPriority: Could not find PhysicsManager, skipping");
                 return;
             }
 
             var entityInRangeType = AccessTools.TypeByName("Vintagestory.Server.EntityInRange");
             if (entityInRangeType != null)
-                entityField = AccessTools.Field(entityInRangeType, "Entity");
+                entityRef = AccessTools.FieldRefAccess<Entity>(entityInRangeType, "Entity");
 
             var connClientType = AccessTools.TypeByName("Vintagestory.Server.ConnectedClient");
             if (connClientType != null)
             {
-                nowInRangeField = AccessTools.Field(connClientType, "entitiesNowInRange");
-                playerField = AccessTools.Field(connClientType, "Player");
+                nowInRangeRef = AccessTools.FieldRefAccess<System.Collections.IList>(connClientType, "entitiesNowInRange");
+                playerRef = AccessTools.FieldRefAccess<IServerPlayer>(connClientType, "Player");
             }
 
-            clientListField = AccessTools.Field(physMgr, "ClientList");
+            clientListRef = AccessTools.FieldRefAccess<System.Collections.IList>(physMgr, "ClientList");
 
             var sendChanges = AccessTools.Method(physMgr, "SendTrackedEntitiesStateChanges");
             if (sendChanges == null)
             {
-                api.Logger.Warning("[Synergy] S4: Could not find SendTrackedEntitiesStateChanges, skipping");
+                api.Logger.Warning("[Synergy] SpawnPriority: Could not find SendTrackedEntitiesStateChanges, skipping");
                 return;
             }
 
@@ -65,16 +64,16 @@ namespace Synergy.Server
             harmony.Patch(sendChanges,
                 prefix: new HarmonyMethod(typeof(SpawnPriorityOrdering), nameof(Prefix_SendTrackedEntitiesStateChanges)));
 
-            api.Logger.Notification("[Synergy] S4: Entity spawn priority ordering active");
+            api.Logger.Notification("[Synergy] SpawnPriority: Entity spawn priority ordering active");
         }
 
         public static void Prefix_SendTrackedEntitiesStateChanges(object __instance)
         {
-            if (disabled || entityField == null || clientListField == null) return;
+            if (disabled || entityRef == null || clientListRef == null) return;
 
             try
             {
-                var clientList = clientListField.GetValue(__instance) as System.Collections.IList;
+                var clientList = clientListRef(__instance);
                 if (clientList == null || clientList.Count == 0) return;
 
                 // Copy to avoid "Collection was modified" if another mod/thread modifies ClientList
@@ -83,13 +82,13 @@ namespace Synergy.Server
 
                 foreach (var client in clients)
                 {
-                    if (nowInRangeField == null) continue;
+                    if (nowInRangeRef == null) continue;
 
-                    var nowInRange = nowInRangeField.GetValue(client) as System.Collections.IList;
+                    var nowInRange = nowInRangeRef(client);
                     if (nowInRange == null || nowInRange.Count <= 1) continue;
 
-                    if (playerField == null) continue;
-                    var player = playerField.GetValue(client) as IServerPlayer;
+                    if (playerRef == null) continue;
+                    var player = playerRef(client);
                     if (player?.Entity == null) continue;
 
                     var playerPos = player.Entity.Pos.XYZ;
@@ -97,7 +96,7 @@ namespace Synergy.Server
                     var sortList = new List<(object item, double distSq)>(nowInRange.Count);
                     foreach (var item in nowInRange)
                     {
-                        var entity = entityField.GetValue(item) as Entity;
+                        var entity = entityRef(item);
                         if (entity == null)
                         {
                             sortList.Add((item, 0));
@@ -124,7 +123,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] S4: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] SpawnPriority: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
             }
         }

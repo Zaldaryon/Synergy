@@ -44,7 +44,7 @@ namespace Synergy.Server
             var onGameTick = AccessTools.Method(behaviorType, "OnGameTick", new[] { typeof(float) });
             if (onGameTick == null)
             {
-                api.Logger.Warning("[Synergy] P16: Could not find EntityBehaviorRepulseAgents.OnGameTick, skipping");
+                api.Logger.Warning("[Synergy] RepulseThrottle: Could not find EntityBehaviorRepulseAgents.OnGameTick, skipping");
                 return;
             }
 
@@ -56,7 +56,7 @@ namespace Synergy.Server
 
             api.Event.RegisterGameTickListener(_ => Interlocked.Increment(ref tickCounter), 1);
 
-            api.Logger.Notification("[Synergy] P16: Entity repulsion throttle active");
+            api.Logger.Notification("[Synergy] RepulseThrottle: Entity repulsion throttle active");
         }
 
         public static bool Prefix_OnGameTick(EntityBehaviorRepulseAgents __instance)
@@ -87,7 +87,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P16: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] RepulseThrottle: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

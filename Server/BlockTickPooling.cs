@@ -8,7 +8,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// P3: Pool BlockPos objects in random block tick loop to reduce GC pressure.
+    /// Pool BlockPos objects in random block tick loop to reduce GC pressure.
     /// Patches tryTickBlock to reuse BlockPos from a ThreadStatic pool instead of calling Copy().
     /// Pool is pre-populated and resets index each tick cycle via OnSeparateThreadTick prefix.
     /// Vanilla behavior preserved: same blocks ticked at same rate, only allocation pattern changes.
@@ -35,7 +35,7 @@ namespace Synergy.Server
             var targetType = AccessTools.TypeByName("Vintagestory.Server.ServerSystemBlockSimulation");
             if (targetType == null)
             {
-                api.Logger.Warning("[Synergy] P3: Could not find ServerSystemBlockSimulation, skipping");
+                api.Logger.Warning("[Synergy] BlockTickPooling: Could not find ServerSystemBlockSimulation, skipping");
                 return;
             }
 
@@ -43,7 +43,7 @@ namespace Synergy.Server
                 new[] { typeof(Block), typeof(BlockPos) });
             if (tryTickBlock == null)
             {
-                api.Logger.Warning("[Synergy] P3: Could not find tryTickBlock method, skipping");
+                api.Logger.Warning("[Synergy] BlockTickPooling: Could not find tryTickBlock method, skipping");
                 return;
             }
 
@@ -51,7 +51,7 @@ namespace Synergy.Server
             var onSepThread = AccessTools.Method(targetType, "OnSeparateThreadTick", Type.EmptyTypes);
             if (onSepThread == null)
             {
-                api.Logger.Warning("[Synergy] P3: Could not find OnSeparateThreadTick, skipping");
+                api.Logger.Warning("[Synergy] BlockTickPooling: Could not find OnSeparateThreadTick, skipping");
                 return;
             }
 
@@ -69,7 +69,7 @@ namespace Synergy.Server
             harmony.Patch(onSepThread,
                 prefix: new HarmonyMethod(typeof(BlockTickPooling), nameof(Prefix_OnSeparateThreadTick)));
 
-            api.Logger.Notification("[Synergy] P3: Block tick pooling optimization active");
+            api.Logger.Notification("[Synergy] BlockTickPooling: Block tick pooling optimization active");
         }
 
         public static void Prefix_OnSeparateThreadTick()
@@ -135,7 +135,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P3: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] BlockTickPooling: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

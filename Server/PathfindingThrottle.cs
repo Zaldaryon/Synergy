@@ -44,7 +44,7 @@ namespace Synergy.Server
                 new[] { typeof(PathfinderTask) });
             if (enqueue == null)
             {
-                api.Logger.Warning("[Synergy] P15: Could not find EnqueuePathfinderTask, skipping");
+                api.Logger.Warning("[Synergy] PathfindingThrottle: Could not find EnqueuePathfinderTask, skipping");
                 return;
             }
 
@@ -56,7 +56,7 @@ namespace Synergy.Server
 
             api.Event.RegisterGameTickListener(_ => Interlocked.Increment(ref tickCounter), 20);
 
-            api.Logger.Notification("[Synergy] P15: Pathfinding distance throttle active");
+            api.Logger.Notification("[Synergy] PathfindingThrottle: Pathfinding distance throttle active");
         }
 
         public static bool Prefix_Enqueue(PathfinderTask task)
@@ -103,7 +103,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] P15: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] PathfindingThrottle: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
                 return true;
             }

@@ -49,7 +49,7 @@ namespace Synergy.Server
                         typeof(EnumAICreatureType) });
             if (findPath == null)
             {
-                api.Logger.Warning("[Synergy] P14: Could not find AStar.FindPathOrEscapePath, skipping");
+                api.Logger.Warning("[Synergy] PathfindingPool: Could not find AStar.FindPathOrEscapePath, skipping");
                 return;
             }
 
@@ -81,7 +81,7 @@ namespace Synergy.Server
                     postfix: new HarmonyMethod(typeof(PathfindingOptimizations), nameof(Postfix_CopyPathNodes)));
             }
 
-            api.Logger.Notification("[Synergy] P14: Pathfinding node pooling active (pool size: {0})", NodePoolSize);
+            api.Logger.Notification("[Synergy] PathfindingPool: Pathfinding node pooling active (pool size: {0})", NodePoolSize);
         }
 
         /// <summary>
@@ -187,11 +187,11 @@ namespace Synergy.Server
             if (replacedParentCard == 0 && replacedBlockPos == 0)
             {
                 if (++errorCount >= 5) disabled = true;
-                sapi?.Logger.Warning("[Synergy] P14: Transpiler found no PathNode constructors to replace — IL may have changed");
+                sapi?.Logger.Warning("[Synergy] PathfindingPool: Transpiler found no PathNode constructors to replace — IL may have changed");
             }
             else
             {
-                sapi?.Logger.Debug("[Synergy] P14: Replaced {0} PathNode(parent,card) + {1} PathNode(pos) with pooled versions",
+                sapi?.Logger.Debug("[Synergy] PathfindingPool: Replaced {0} PathNode(parent,card) + {1} PathNode(pos) with pooled versions",
                     replacedParentCard, replacedBlockPos);
             }
         }

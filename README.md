@@ -46,7 +46,10 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 
 3. **Network Flush Consolidation** (`NetworkFlushConsolidationEnabled`)
    - Patches `TcpNetConnection.Send(byte[], bool)` — prefix
+   - Patches `ServerMain.Process()` — postfix (end-of-tick flush)
    - Buffers small uncompressed TCP packets, flushes when buffer exceeds MTU (1400 bytes) or at end of tick
+   - End-of-tick flush via `ServerMain.Process()` postfix ensures packets from `ProcessMain` (inventory interactions, entity updates) are flushed in the same tick they're generated
+   - Follows industry-standard pattern: Netty `FlushConsolidationHandler`, Paper MC, Source Engine snapshots
    - Large or compressed packets flush immediately (high priority)
    - Uses vanilla `Send` path during flush — preserves header format (`length | (compressed ? 1<<31 : 0)`), async behavior, and disconnect handling
    - ThreadStatic re-entry guard prevents recursion during flush
@@ -174,7 +177,9 @@ Edit `Synergy.json` in your `ModConfig` folder. All optimizations are individual
   "EntityTrackingHysteresisEnabled": true,
   "DistanceBasedSendFrequencyEnabled": true,
   "AttributeSyncResyncPreventionEnabled": true,
-  "EntitySpawnPriorityOrderingEnabled": true
+  "EntitySpawnPriorityOrderingEnabled": true,
+  "GcSustainedLowLatencyEnabled": true,
+  "GcDiagnosticsEnabled": true
 }
 ```
 
@@ -190,7 +195,7 @@ Changes require server restart.
 ## Logging Conventions
 
 - Prefix: `[Synergy]`
-- Optimization-specific tags: `P3`, `P8`, `P9`, `P11`, `P13`, `S1`, `S2`, `S3`, `S4`
+- Optimization-specific tags: `BlockTickPooling`, `NetworkFlush`, `InventoryScan`, `ActivationRange`, `CollisionFastPath`, `PathfindingPool`, `PathfindingThrottle`, `RepulseThrottle`, `TrackingHysteresis`, `SendFrequency`, `AttributeSync`, `SpawnPriority`
 - Automatic disable/fallback events are explicitly logged.
 
 ## License

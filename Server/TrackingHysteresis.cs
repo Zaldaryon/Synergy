@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -9,7 +8,7 @@ using Vintagestory.API.Server;
 namespace Synergy.Server
 {
     /// <summary>
-    /// S1: Add hysteresis buffer to entity tracking range to prevent pop-in/pop-out flickering.
+    /// Add hysteresis buffer to entity tracking range to prevent pop-in/pop-out flickering.
     /// Spawn at trackingRange, despawn at trackingRange + buffer.
     /// Buffer is proportional to entity speed: max(8, motion.Length * 20) blocks.
     /// Vanilla behavior preserved: same entities tracked, just with stable boundary.
@@ -22,13 +21,13 @@ namespace Synergy.Server
         private const double MinBufferBlocks = 8.0;
         private const double SpeedMultiplier = 20.0;
 
-        // Cached reflection — resolved once at init
-        private static FieldInfo outOfRangeField;
-        private static FieldInfo playerField;
-        private static FieldInfo esField;
-        private static FieldInfo trackingRangeSqField;
-        private static FieldInfo trackedEntitiesField;
-        private static FieldInfo entityIdField;
+        // IL-emitted fast accessors via Harmony — FieldRef<object, F> for internal types
+        private static AccessTools.FieldRef<object, System.Collections.IList> outOfRangeRef;
+        private static AccessTools.FieldRef<object, IServerPlayer> playerRef;
+        private static AccessTools.FieldRef<object, HashSet<long>> trackedEntitiesRef;
+        private static AccessTools.FieldRef<object, object> esRef;
+        private static AccessTools.FieldRef<object, int> trackingRangeSqRef;
+        private static AccessTools.FieldRef<object, long> entityIdRef;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -39,37 +38,36 @@ namespace Synergy.Server
             var physMgr = AccessTools.TypeByName("Vintagestory.Server.PhysicsManager");
             if (physMgr == null)
             {
-                api.Logger.Warning("[Synergy] S1: Could not find PhysicsManager, skipping");
+                api.Logger.Warning("[Synergy] TrackingHysteresis: Could not find PhysicsManager, skipping");
                 return;
             }
 
             var connClientType = AccessTools.TypeByName("Vintagestory.Server.ConnectedClient");
             if (connClientType == null)
             {
-                api.Logger.Warning("[Synergy] S1: Could not find ConnectedClient, skipping");
+                api.Logger.Warning("[Synergy] TrackingHysteresis: Could not find ConnectedClient, skipping");
                 return;
             }
 
-            // Cache all FieldInfo at init
-            outOfRangeField = AccessTools.Field(connClientType, "entitiesNowOutOfRange");
-            playerField = AccessTools.Field(connClientType, "Player");
-            trackedEntitiesField = AccessTools.Field(connClientType, "TrackedEntities");
-            esField = AccessTools.Field(physMgr, "es");
+            // IL-emitted fast field accessors for internal types
+            outOfRangeRef = AccessTools.FieldRefAccess<System.Collections.IList>(connClientType, "entitiesNowOutOfRange");
+            playerRef = AccessTools.FieldRefAccess<IServerPlayer>(connClientType, "Player");
+            trackedEntitiesRef = AccessTools.FieldRefAccess<HashSet<long>>(connClientType, "TrackedEntities");
+            esRef = AccessTools.FieldRefAccess<object>(physMgr, "es");
 
             var entityDespawnType = AccessTools.TypeByName("Vintagestory.Server.EntityDespawn");
             if (entityDespawnType != null)
-                entityIdField = AccessTools.Field(entityDespawnType, "EntityId");
+                entityIdRef = AccessTools.FieldRefAccess<long>(entityDespawnType, "EntityId");
 
-            // Resolve trackingRangeSq field type from es field's type
             var esType = AccessTools.TypeByName("Vintagestory.Server.ServerSystemEntitySimulation");
             if (esType != null)
-                trackingRangeSqField = AccessTools.Field(esType, "trackingRangeSq");
+                trackingRangeSqRef = AccessTools.FieldRefAccess<int>(esType, "trackingRangeSq");
 
             var updateLists = AccessTools.Method(physMgr, "UpdateTrackedEntityLists",
                 new[] { connClientType, typeof(int) });
             if (updateLists == null)
             {
-                api.Logger.Warning("[Synergy] S1: Could not find UpdateTrackedEntityLists, skipping");
+                api.Logger.Warning("[Synergy] TrackingHysteresis: Could not find UpdateTrackedEntityLists, skipping");
                 return;
             }
 
@@ -79,7 +77,7 @@ namespace Synergy.Server
             harmony.Patch(updateLists,
                 postfix: new HarmonyMethod(typeof(TrackingHysteresis), nameof(Postfix_UpdateTrackedEntityLists)));
 
-            api.Logger.Notification("[Synergy] S1: Entity tracking hysteresis active");
+            api.Logger.Notification("[Synergy] TrackingHysteresis: Entity tracking hysteresis active");
         }
 
         public static void Postfix_UpdateTrackedEntityLists(object client, int threadCount, object __instance)
@@ -88,40 +86,32 @@ namespace Synergy.Server
 
             try
             {
-                if (outOfRangeField == null || entityIdField == null) return;
+                if (outOfRangeRef == null || entityIdRef == null) return;
 
-                var outOfRange = outOfRangeField.GetValue(client) as System.Collections.IList;
+                var outOfRange = outOfRangeRef(client);
                 if (outOfRange == null || outOfRange.Count == 0) return;
 
-                var player = playerField?.GetValue(client) as IServerPlayer;
+                var player = playerRef?.Invoke(client);
                 if (player?.Entity == null) return;
 
                 var playerPos = player.Entity.Pos;
 
                 // Get tracking range squared
                 int trackingRangeSq = 16384; // default 128²
-                if (esField != null && trackingRangeSqField != null)
+                if (esRef != null && trackingRangeSqRef != null)
                 {
-                    var es = esField.GetValue(__instance);
+                    var es = esRef(__instance);
                     if (es != null)
-                    {
-                        var val = trackingRangeSqField.GetValue(es);
-                        if (val is int intVal) trackingRangeSq = intVal;
-                        else if (val is long longVal) trackingRangeSq = (int)longVal;
-                    }
+                        trackingRangeSq = trackingRangeSqRef(es);
                 }
 
-                var trackedEntities = trackedEntitiesField?.GetValue(client) as HashSet<long>;
+                var trackedEntities = trackedEntitiesRef?.Invoke(client);
 
                 var toKeep = new List<int>();
                 for (int i = 0; i < outOfRange.Count; i++)
                 {
                     var despawnItem = outOfRange[i];
-                    long entityId;
-                    var idVal = entityIdField.GetValue(despawnItem);
-                    if (idVal is long l) entityId = l;
-                    else if (idVal is int iv) entityId = iv;
-                    else continue;
+                    long entityId = entityIdRef(despawnItem);
                     var entity = sapi.World.GetEntityById(entityId);
                     if (entity == null) continue;
 
@@ -152,7 +142,7 @@ namespace Synergy.Server
                 if (++errorCount >= 5)
                 {
                     disabled = true;
-                    sapi?.Logger.Warning("[Synergy] S1: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
+                    sapi?.Logger.Warning("[Synergy] TrackingHysteresis: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);
                 }
             }
         }
