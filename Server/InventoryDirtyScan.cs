@@ -55,6 +55,14 @@ namespace Synergy.Server
                     postfix: new HarmonyMethod(typeof(InventoryDirtyScan), nameof(Postfix_DidModifyItemSlot)));
             }
 
+            var markDirtySingle = AccessTools.Method(typeof(InventoryBase), "DidModifyItemSlot",
+                new[] { typeof(ItemSlot) });
+            if (markDirtySingle != null)
+            {
+                harmony.Patch(markDirtySingle,
+                    postfix: new HarmonyMethod(typeof(InventoryDirtyScan), nameof(Postfix_DidModifyItemSlot)));
+            }
+
             api.Logger.Notification("[Synergy] InventoryScan: Inventory dirty scan optimization active");
         }
 

@@ -8,7 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
-- Current version: `1.1.3`
+- Current version: `1.1.4`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
