@@ -38,7 +38,8 @@ namespace Synergy.Server
             "deaddecay",
             "grow",
             "multiply",
-            "harvestable"
+            // "harvestable" removed — behavior has ThreadSafe=true, lives in ServerBehaviorsThreadsafe
+            // (ticked by PhysicsManager on physics thread), never found in ServerBehaviorsMainThread.
         };
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)

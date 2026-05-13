@@ -105,11 +105,18 @@ namespace Synergy.Server
                         trackingRangeSq = trackingRangeSqRef(es);
                 }
 
+                double trackingRange = Math.Sqrt(trackingRangeSq); // cached outside loop
+
                 var trackedEntities = trackedEntitiesRef?.Invoke(client);
+                const int TrackedEntitiesPerClientCap = 256;
 
                 var toKeep = new List<int>();
                 for (int i = 0; i < outOfRange.Count; i++)
                 {
+                    // Respect vanilla cap
+                    if (trackedEntities != null && trackedEntities.Count >= TrackedEntitiesPerClientCap)
+                        break;
+
                     var despawnItem = outOfRange[i];
                     long entityId = entityIdRef(despawnItem);
                     var entity = sapi.World.GetEntityById(entityId);
@@ -117,8 +124,8 @@ namespace Synergy.Server
 
                     double motionLen = entity.Pos.Motion.Length();
                     double bufferBlocks = Math.Max(MinBufferBlocks, motionLen * SpeedMultiplier);
-                    double trackingRange = Math.Sqrt(trackingRangeSq);
-                    double bufferRangeSq = (trackingRange + bufferBlocks) * (trackingRange + bufferBlocks);
+                    double bufferEdge = trackingRange + bufferBlocks;
+                    double bufferRangeSq = bufferEdge * bufferEdge;
 
                     double dx = entity.Pos.X - playerPos.X;
                     double dy = entity.Pos.Y - playerPos.Y;

@@ -6,8 +6,7 @@ namespace Synergy
     public class SynergyConfig
     {
         // Server-side performance
-        public bool BlockTickPoolingEnabled { get; set; } = true;
-        public bool NetworkFlushConsolidationEnabled { get; set; } = true;
+        public bool NetworkFlushConsolidationEnabled { get; set; } = false;
         public bool InventoryDirtyScanEnabled { get; set; } = true;
         public bool EntityActivationRangeEnabled { get; set; } = true;
         public float EntityActivationRangeBlocks { get; set; } = 48f;
