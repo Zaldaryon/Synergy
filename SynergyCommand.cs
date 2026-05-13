@@ -15,7 +15,6 @@ namespace Synergy
             ("activationrange",  "Entity Activation Range",     c => c.EntityActivationRangeEnabled,          (c, v) => c.EntityActivationRangeEnabled = v),
             ("collisionfastpath", "Collision Fast-Path",         c => c.CollisionFastPathEnabled,              (c, v) => c.CollisionFastPathEnabled = v),
             ("networkflush",     "Network Flush Consolidation",  c => c.NetworkFlushConsolidationEnabled,      (c, v) => c.NetworkFlushConsolidationEnabled = v),
-            ("blocktickpool",    "Block Tick Pooling",           c => c.BlockTickPoolingEnabled,               (c, v) => c.BlockTickPoolingEnabled = v),
             ("inventoryscan",    "Inventory Dirty Scan",         c => c.InventoryDirtyScanEnabled,             (c, v) => c.InventoryDirtyScanEnabled = v),
             ("pathfindingpool",  "Pathfinding Node Pooling",     c => c.PathfindingOptimizationsEnabled,       (c, v) => c.PathfindingOptimizationsEnabled = v),
             ("pathfindingthrottle", "Pathfinding Throttle",      c => c.PathfindingThrottleEnabled,            (c, v) => c.PathfindingThrottleEnabled = v),

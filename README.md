@@ -8,7 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
-- Current version: `1.1.4`
+- Current version: `1.1.5`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
@@ -24,15 +24,15 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - **Auto-disable on conflict** — patches check for existing Harmony patches from other mods before applying. Transpiler or prefix conflicts cause automatic skip with logged warning.
 - **Circuit breaker** — each optimization auto-disables after 5 consecutive errors, falling back to vanilla.
 
-## Optimization Catalog (12)
+## Optimization Catalog (13)
 
 ### Server-Side Performance (8)
 
 1. **Entity Activation Range** (`EntityActivationRangeEnabled`)
    - Patches `ServerSystemEntitySimulation.TickEntities(float)` — prefix (replaces method)
    - Skips `OnGameTick` for non-player entities beyond 48 blocks of any player
-   - Whitelisted behaviors still tick for sleeping entities: breathe, health, timeddespawn, deaddecay, grow, multiply, harvestable
-   - Calendar-based behaviors (grow, multiply, harvestable) catch up automatically via `Calendar.TotalHours`
+   - Whitelisted behaviors still tick for sleeping entities: breathe, health, timeddespawn, deaddecay, grow, multiply
+   - Calendar-based behaviors (grow, multiply) catch up automatically via `Calendar.TotalHours`
    - Entities in lava or on fire always get full tick (fire/ignition/extinguishing logic preserved)
    - Players and `AlwaysActive` entities always get full tick
    - Includes `FrameProfiler` calls matching vanilla for `.debug tickprofile` compatibility
@@ -42,96 +42,92 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
    - Patches `CollisionTester.ApplyTerrainCollision(Entity, EntityPos, float, ref Vec3d, float, float)` — prefix
    - Skips collision resolution when ALL conditions met: motion == (0,0,0), not in liquid, not swimming, not in lava, not on fire
    - Sets `CollidedVertically = false` and `CollidedHorizontally = false` to match vanilla behavior with zero motion
-   - Vanilla verified: with zero motion, `pushOutY/X/Z` all return 0, no `OnEntityCollide` callbacks fire, position unchanged
    - **Impact:** ~5-15% physics CPU. Dense animal pens benefit most.
 
 3. **Network Flush Consolidation** (`NetworkFlushConsolidationEnabled`)
    - Patches `TcpNetConnection.Send(byte[], bool)` — prefix
    - Patches `ServerMain.Process()` — postfix (end-of-tick flush)
-   - Buffers small uncompressed TCP packets, flushes when buffer exceeds MTU (1400 bytes) or at end of tick
-   - End-of-tick flush via `ServerMain.Process()` postfix ensures packets from `ProcessMain` (inventory interactions, entity updates) are flushed in the same tick they're generated
-   - Follows industry-standard pattern: Netty `FlushConsolidationHandler`, Paper MC, Source Engine snapshots
-   - Large or compressed packets flush immediately (high priority)
-   - Uses vanilla `Send` path during flush — preserves header format (`length | (compressed ? 1<<31 : 0)`), async behavior, and disconnect handling
-   - ThreadStatic re-entry guard prevents recursion during flush
-   - Checks `Connected` field before flush, removes dead connections from buffer dictionary
+   - Buffers small uncompressed TCP packets into a consolidated byte buffer per connection
+   - Flushes as a **single `Socket.SendAsync`** when buffer exceeds MTU (1400 bytes) or at end of tick
+   - Reduces N TCP segments to 1 per flush — real syscall and segment reduction
+   - Large or compressed packets flush buffer first (preserving order) then go direct via vanilla
+   - Uses `ArrayPool<byte>` for buffer management
+   - **Default: disabled** — enable after validating in your environment
    - **Impact:** ~3-5% server CPU with 10+ players. Reduces per-packet syscall overhead.
 
-4. **Block Tick Pooling** (`BlockTickPoolingEnabled`)
-   - Patches `ServerSystemBlockSimulation.tryTickBlock(Block, BlockPos)` — prefix
-   - Patches `ServerSystemBlockSimulation.OnSeparateThreadTick(float)` — prefix (pool reset)
-   - Pools 512 `BlockPos` objects per thread via `[ThreadStatic]` array, pre-populated on first use
-   - Pool index resets each tick cycle via `OnSeparateThreadTick` prefix
-   - Falls back to `source.Copy()` when pool exhausted (>512 ticks per cycle)
-   - `BlockPosWithExtraObject` created via `Activator.CreateInstance` for ticks with extra data
-   - **Impact:** ~1-2% TPS with 10+ players. Reduces Gen0 GC pressure (~16 MB/s allocation eliminated).
-
-5. **Inventory Dirty Scan** (`InventoryDirtyScanEnabled`)
+4. **Inventory Dirty Scan** (`InventoryDirtyScanEnabled`)
    - Patches `ServerSystemInventory.SendDirtySlots(float)` — prefix
-   - Patches `InventoryBase.DidModifyItemSlot(ItemSlot, ItemStack)` — postfix
+   - Patches `InventoryBase.MarkSlotDirty(int)` — postfix (primary dirty signal)
+   - Also patches `DidModifyItemSlot`, `DiscardAll`, `DropAll` as safety fallbacks
    - Uses `Volatile.Read/Write` for thread-safe dirty flag
    - When flag is 0 (nothing modified), skips the entire client/inventory iteration loop
-   - Vanilla runs every 30ms iterating all clients → all inventories → checking `IsDirty`
    - **Impact:** <1% TPS. Mainly benefits 30+ player servers where most inventories are idle.
 
-6. **Pathfinding Node Pooling** (`PathfindingOptimizationsEnabled`)
+5. **Pathfinding Node Pooling** (`PathfindingOptimizationsEnabled`)
    - Transpiler on `AStar.FindPathOrEscapePath` — replaces `new PathNode()` with pooled equivalents
    - Prefix resets per-thread pool (4096 pre-allocated PathNode objects) at start of each search
    - Postfix on `AStar.FindPath` and `PathfindSystem.FindEscapePath` copies pooled nodes for API safety
    - Falls back to vanilla `new PathNode()` when pool exhausted (>4096 nodes per search)
-   - Reference: A* Pathfinding Project (arongranberg.com) — node pooling is industry standard
    - **Impact:** ~87% reduction in pathfinding heap allocations. Reduces GC pressure ~7 MB/s with 200 entities.
 
-7. **Pathfinding Distance Throttle** (`PathfindingThrottleEnabled`)
+6. **Pathfinding Distance Throttle** (`PathfindingThrottleEnabled`)
    - Patches `PathfindingAsync.EnqueuePathfinderTask(PathfinderTask)` — prefix
    - Reduces pathfinding frequency based on distance to nearest player
    - <32 blocks: every request. 32-64: ~1 in 2. 64-96: ~1 in 4. >96: ~1 in 8
    - Skipped tasks marked Finished with null waypoints (entity retries next tick)
-   - Reference: Airplane/Pufferfish DEAR (Dynamic Entity Activation Range)
    - **Impact:** ~30-60% pathfinding CPU reduction. Distant entities react ~100-200ms slower (imperceptible).
 
-8. **Entity Repulsion Throttle** (`RepulseAgentsThrottleEnabled`)
+7. **Entity Repulsion Throttle** (`RepulseAgentsThrottleEnabled`)
    - Patches `EntityBehaviorRepulseAgents.OnGameTick(float)` — prefix
-   - Vanilla runs repulsion every tick per entity with zero distance throttling — O(N²) in dense pens
    - <32 blocks: every tick (vanilla). 32-64: every 4th tick. >64: skip entirely
    - Repulsion is purely cosmetic at distance — no gameplay impact from skipping
-   - Reference: OptiTime client-side RepulseAgentsOptimization (same concept)
    - **Impact:** ~3-8% TPS in dense animal pens. Scales quadratically with entity density.
 
-### Server-Client Fluidity (4)
+8. **GC Sustained Low Latency** (`GcSustainedLowLatencyEnabled`)
+   - Sets `GCSettings.LatencyMode = SustainedLowLatency` — suppresses blocking Gen2 collections
+   - Includes heap monitor: every 5 minutes checks heap size
+   - At 4 GB: logs warning. At 8 GB: triggers non-blocking background Gen2 GC
+   - Prevents unbounded heap growth while maintaining low-latency benefits
+   - **Impact:** Eliminates 10-50ms GC pause spikes.
+
+### Server-Client Fluidity (5)
 
 9. **Entity Tracking Hysteresis** (`EntityTrackingHysteresisEnabled`)
    - Patches `PhysicsManager.UpdateTrackedEntityLists(ConnectedClient, int)` — postfix
    - Adds speed-proportional buffer zone to tracking range: `max(8, motion.Length * 20)` blocks
    - Entities within `trackingRange + buffer` are kept tracked even when vanilla would despawn them
-   - Prevents entity pop-in/pop-out flickering at view distance boundary
-   - All `FieldInfo` cached at init (6 fields)
+   - Respects `TrackedEntitiesPerClient` cap (256) to prevent overload
+   - Caches `Math.Sqrt(trackingRangeSq)` outside entity loop
    - **Impact:** Eliminates entity flickering at tracking boundary. No TPS cost.
 
 10. **Distance-Based Send Frequency** (`DistanceBasedSendFrequencyEnabled`)
-   - Patches `PhysicsManager.BuildPositionPacket(Entity, bool, Dict, Dict)` — prefix
-   - `IsTracked == 2` (≤50 blocks): every tick at 30Hz (unchanged)
-   - `IsTracked == 1` (50-128 blocks): every 2nd tick at 15Hz
-   - Fast-moving entities (motion > 0.2 blocks/tick) always send at 30Hz
-   - Uses separate frame counter — does not interfere with vanilla's `tick` attribute
-   - Client interpolation handles variable rates via `tickDiff` in position packets
-   - **Impact:** ~30-40% bandwidth reduction for distant entities. Visually identical at 50+ blocks.
+    - Patches `PhysicsManager.BuildPositionPacket(Entity, bool, Dict, Dict)` — prefix
+    - `IsTracked == 2` (≤50 blocks): every tick at 30Hz (unchanged)
+    - `IsTracked == 1` (50-128 blocks): every 2nd tick at 15Hz
+    - Fast-moving entities (motion > 0.2 blocks/tick) always send at 30Hz
+    - Per-entity phase throttle (EntityId parity) prevents synchronized bursts
+    - Client interpolation handles variable rates via `tickDiff` in position packets
+    - **Impact:** ~30-40% bandwidth reduction for distant entities. Visually identical at 50+ blocks.
 
 11. **Attribute Sync Delta Updates** (`AttributeSyncResyncPreventionEnabled`)
-   - Patches `SyncedTreeAttribute.RemoveAttribute(string)` — prefix
-   - Vanilla calls `MarkAllDirty()` on every `RemoveAttribute` — triggers full attribute tree resync (500-2000 bytes)
-   - Mod calls `base.RemoveAttribute(key)` then adds key to `attributePathsDirty` directly
-   - Avoids triggering modified listeners (matching vanilla's `MarkAllDirty` which also suppresses them)
-   - Client receives deletion via `PartialUpdate(path, null)` → `DeleteAttributeByPath(path)`
-   - Fallback: next full sync (every 5s) corrects any inconsistency
-   - **Impact:** Saves 500-2000 bytes per `RemoveAttribute` event. Adds up with many entities.
+    - Patches `SyncedTreeAttribute.RemoveAttribute(string)` — prefix
+    - Vanilla calls `MarkAllDirty()` on every `RemoveAttribute` — triggers full attribute tree resync (500-2000 bytes)
+    - Mod calls `base.RemoveAttribute(key)` then adds key to `attributePathsDirty` directly
+    - Client receives deletion via `PartialUpdate(path, null)` → `DeleteAttributeByPath(path)`
+    - Fallback: next full sync (every 5s) corrects any inconsistency
+    - **Impact:** Saves 500-2000 bytes per `RemoveAttribute` event. Adds up with many entities.
 
 12. **Entity Spawn Priority Ordering** (`EntitySpawnPriorityOrderingEnabled`)
-   - Patches `PhysicsManager.SendTrackedEntitiesStateChanges()` — prefix
-   - Sorts `entitiesNowInRange` by distance (farthest-first)
-   - Client uses `Stack<Entity>` (LIFO) for `EntityLoadQueue` — farthest-first send order inverts to nearest-first processing
-   - All `FieldInfo` cached at init (4 fields)
-   - **Impact:** Nearest entities appear ~100-500ms sooner after teleport/login.
+    - Patches `PhysicsManager.SendTrackedEntitiesStateChanges()` — prefix
+    - Sorts `entitiesNowInRange` by distance (farthest-first)
+    - Client uses `Stack<Entity>` (LIFO) for `EntityLoadQueue` — farthest-first send order inverts to nearest-first processing
+    - Uses `[ThreadStatic]` sort buffer to eliminate per-call allocations
+    - **Impact:** Nearest entities appear ~100-500ms sooner after teleport/login.
+
+13. **GC Diagnostics** (`GcDiagnosticsEnabled`)
+    - Logs GC state at startup (Server GC mode, latency mode, heap size, fragmentation)
+    - No patches, no runtime cost
+    - **Impact:** Diagnostic visibility only.
 
 ## Estimated Total Impact
 
@@ -166,8 +162,7 @@ Edit `Synergy.json` in your `ModConfig` folder. All optimizations are individual
 
 ```json
 {
-  "BlockTickPoolingEnabled": true,
-  "NetworkFlushConsolidationEnabled": true,
+  "NetworkFlushConsolidationEnabled": false,
   "InventoryDirtyScanEnabled": true,
   "EntityActivationRangeEnabled": true,
   "EntityActivationRangeBlocks": 48.0,
@@ -193,10 +188,21 @@ Changes require server restart.
 - Compatible with **Tungsten** (different optimization targets, no overlap).
 - Compatible with **OptiTime** (client-side only, no server overlap).
 
+## Changelog (1.1.5)
+
+- **Removed** BlockTickPooling — race condition between producer/consumer threads made it unsafe (gain was only ~32 KB/s)
+- **Rewritten** NetworkFlushConsolidation — now actually consolidates packets into single `SendAsync` (was just delaying without reducing segments). Default disabled until validated.
+- **Fixed** InventoryDirtyScan — patches `MarkSlotDirty` instead of `DidModifyItemSlot`, catching all dirty paths (ovens, crafting grids, discard)
+- **Fixed** TrackingHysteresis — caches `sqrt(trackingRangeSq)` outside loop, respects `TrackedEntitiesPerClient` cap (256)
+- **Fixed** DistanceSendFrequency — per-entity phase throttle eliminates synchronized burst pattern
+- **Fixed** SpawnPriorityOrdering — reuses sort buffer via `[ThreadStatic]` to eliminate per-call allocations
+- **Added** GC heap monitor — prevents unbounded heap growth under SustainedLowLatency (warns at 4GB, background GC at 8GB)
+- **Removed** dead-code `harvestable` from EntityActivationRange whitelist
+
 ## Logging Conventions
 
 - Prefix: `[Synergy]`
-- Optimization-specific tags: `BlockTickPooling`, `NetworkFlush`, `InventoryScan`, `ActivationRange`, `CollisionFastPath`, `PathfindingPool`, `PathfindingThrottle`, `RepulseThrottle`, `TrackingHysteresis`, `SendFrequency`, `AttributeSync`, `SpawnPriority`
+- Optimization-specific tags: `NetworkFlush`, `InventoryScan`, `ActivationRange`, `CollisionFastPath`, `PathfindingPool`, `PathfindingThrottle`, `RepulseThrottle`, `TrackingHysteresis`, `SendFrequency`, `AttributeSync`, `SpawnPriority`
 - Automatic disable/fallback events are explicitly logged.
 
 ## License

@@ -31,7 +31,7 @@ namespace Synergy.Server
         private static ICoreServerAPI sapi;
         private static int errorCount;
         private static bool disabled;
-        private const double FastMotionThresholdSq = 0.04; // ~0.2 blocks/tick
+        private const double FastMotionThresholdSq = 0.001; // ~0.03 blocks/tick — any real movement
         private static int frameCounter;
 
         // Fast accessor for internal Entity.tagsDirty field
@@ -119,8 +119,11 @@ namespace Synergy.Server
                 if (motion.X * motion.X + motion.Y * motion.Y + motion.Z * motion.Z > FastMotionThresholdSq)
                     return true;
 
-                // Skip odd frames for distant entities (30Hz → 15Hz)
-                if (Volatile.Read(ref frameCounter) % 2 != 0)
+                // Per-entity phase throttle: use EntityId parity as phase offset.
+                // Each entity alternates independently, avoiding synchronized bursts.
+                long framePhase = Volatile.Read(ref frameCounter) & 1L;
+                long entityPhase = entity.EntityId & 1L;
+                if (entityPhase != framePhase)
                     return false;
 
                 return true;

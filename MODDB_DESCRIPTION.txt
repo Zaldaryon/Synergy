@@ -1,0 +1,125 @@
+<p><strong>Coordinated server-side performance and fluidity optimizations for Vintage Story. Reduces TPS overhead, bandwidth usage, and GC pressure while improving multiplayer smoothness.</strong></p>
+
+<p><strong>Works as server-only, or with both client and server — no side is required.</strong></p>
+
+<p>For client-side performance, try <a href="https://mods.vintagestory.at/optitime">OptiTime</a>. For allocation reduction, try <a href="https://mods.vintagestory.at/tungsten">Tungsten</a>. All three are fully compatible.</p>
+
+<h2>What it does</h2>
+<ul>
+  <li><strong>Better TPS</strong> — 15-40% tick time reduction depending on server load</li>
+  <li><strong>Less bandwidth</strong> — 30-40% reduction in network traffic for distant entities</li>
+  <li><strong>Less GC pressure</strong> — 87% reduction in pathfinding allocations, pooled buffers everywhere</li>
+  <li><strong>Smoother multiplayer</strong> — eliminates entity flickering, faster entity loading after teleport</li>
+  <li><strong>No gameplay changes</strong> — same game, same paths, same physics, just faster</li>
+</ul>
+
+<h2>Performance gains</h2>
+<ul>
+  <li><strong>5 players, 150 entities</strong>: ~8-15% TPS gain, ~20-25% bandwidth saved</li>
+  <li><strong>10 players, 300 entities</strong>: ~15-25% TPS gain, ~30-35% bandwidth saved</li>
+  <li><strong>30+ players, 500+ entities</strong>: ~25-40% TPS gain, ~35-40% bandwidth saved</li>
+</ul>
+<p>The more entities and players, the bigger the improvement.</p>
+
+<h2>What gets optimized</h2>
+<p>Synergy ships with <strong>13 optimizations</strong> in three categories:</p>
+
+<h3>Server Performance (8)</h3>
+<ul>
+  <li><strong>Entity Activation Range</strong> — Skip ticking distant entities (&gt;48 blocks). Whitelisted behaviors (breathe, health, despawn, grow) still run. Entities in lava/fire always tick. <em>Biggest single optimization: ~10-30% TPS.</em></li>
+  <li><strong>Collision Fast-Path</strong> — Skip collision resolution for stationary entities with no environmental flags. Dense animal pens benefit most. <em>~5-15% physics CPU.</em></li>
+  <li><strong>Network Flush Consolidation</strong> — Consolidates small TCP packets into a single SendAsync per connection per tick. Reduces syscalls and TCP segments. <em>~3-5% CPU with 10+ players. Default disabled — enable after validating.</em></li>
+  <li><strong>Inventory Dirty Scan</strong> — Skip full inventory iteration when nothing changed. Patches MarkSlotDirty + fallback paths for complete coverage. <em>&lt;1% TPS, benefits 30+ player servers.</em></li>
+  <li><strong>Pathfinding Node Pooling</strong> — Pool A* PathNode objects via transpiler. <em>~87% reduction in pathfinding heap allocations.</em></li>
+  <li><strong>Pathfinding Distance Throttle</strong> — Reduce pathfinding frequency for distant entities. Close entities pathfind normally; distant entities are throttled proportionally. <em>~30-60% pathfinding CPU.</em></li>
+  <li><strong>Entity Repulsion Throttle</strong> — Reduce O(N²) repulsion calculations for distant entities. <em>~3-8% TPS in dense animal pens.</em></li>
+  <li><strong>GC Sustained Low Latency</strong> — Suppresses blocking Gen2 GC. Includes heap monitor (warns at 4GB, background GC at 8GB) to prevent unbounded growth. <em>Eliminates 10-50ms pause spikes.</em></li>
+</ul>
+
+<h3>Multiplayer Fluidity (4)</h3>
+<ul>
+  <li><strong>Entity Tracking Hysteresis</strong> — Speed-proportional buffer zone on tracking range prevents entity pop-in/pop-out flickering at view distance boundary. Respects vanilla entity cap.</li>
+  <li><strong>Distance-Based Send Frequency</strong> — Reduce position packet rate for distant entities from 30Hz to 15Hz. Per-entity phase throttle prevents burst patterns. Fast-moving entities always send at full rate. <em>~30-40% bandwidth saved.</em></li>
+  <li><strong>Attribute Sync Delta Updates</strong> — Convert RemoveAttribute full tree resyncs into lightweight delta updates. <em>Saves 500-2000 bytes per event.</em></li>
+  <li><strong>Entity Spawn Priority Ordering</strong> — Sort entity spawns by distance so nearby entities appear first after teleport/login. Zero-allocation via reusable sort buffer.</li>
+</ul>
+
+<h3>Runtime Tuning (1)</h3>
+<ul>
+  <li><strong>GC Diagnostics</strong> — Logs GC configuration at startup for server admins to diagnose memory issues. No runtime cost.</li>
+</ul>
+
+<h2>Commands</h2>
+<p>All commands require admin privileges (<code>controlserver</code>):</p>
+<ul>
+  <li><code>/synergy</code> — Show status of all optimizations</li>
+  <li><code>/synergy &lt;name&gt; on/off</code> — Toggle individual optimization</li>
+  <li><code>/synergy all on/off</code> — Toggle all optimizations</li>
+  <li><code>/synergy reload</code> — Reload config from disk</li>
+</ul>
+<p>Available names: <code>activationrange</code>, <code>collisionfastpath</code>, <code>networkflush</code>, <code>inventoryscan</code>, <code>pathfindingpool</code>, <code>pathfindingthrottle</code>, <code>hysteresis</code>, <code>sendfrequency</code>, <code>attributedelta</code>, <code>spawnpriority</code>, <code>repulsethrottle</code></p>
+<p><strong>Note:</strong> Changes require server restart.</p>
+
+<h2>Safety</h2>
+<ul>
+  <li><strong>Auto-disable on conflict</strong> — Each optimization checks for existing Harmony patches from other mods before applying. If a conflict is detected, Synergy skips its patch with a logged warning.</li>
+  <li><strong>Circuit breaker</strong> — Each optimization auto-disables after 5 consecutive errors, falling back to vanilla behavior.</li>
+  <li><strong>Individually toggleable</strong> — Every optimization can be turned on/off in the config file.</li>
+  <li><strong>Safe uninstall</strong> — Remove the mod and restart. No persistent changes to world data.</li>
+</ul>
+
+<h2>Configuration</h2>
+<p>Edit <code>Synergy.json</code> in your <code>ModConfig</code> folder:</p>
+<pre>
+{
+  "NetworkFlushConsolidationEnabled": false,
+  "InventoryDirtyScanEnabled": true,
+  "EntityActivationRangeEnabled": true,
+  "EntityActivationRangeBlocks": 48.0,
+  "CollisionFastPathEnabled": true,
+  "PathfindingOptimizationsEnabled": true,
+  "PathfindingThrottleEnabled": true,
+  "RepulseAgentsThrottleEnabled": true,
+  "EntityTrackingHysteresisEnabled": true,
+  "DistanceBasedSendFrequencyEnabled": true,
+  "AttributeSyncResyncPreventionEnabled": true,
+  "EntitySpawnPriorityOrderingEnabled": true,
+  "GcSustainedLowLatencyEnabled": true,
+  "GcDiagnosticsEnabled": true
+}
+</pre>
+
+<h2>Compatibility</h2>
+<p><strong>Works with almost all mods.</strong> Tested and compatible with:</p>
+<ul>
+  <li>✅ <a href="https://mods.vintagestory.at/tungsten">Tungsten</a> (different optimization targets, auto-detected)</li>
+  <li>✅ <a href="https://mods.vintagestory.at/optitime">OptiTime</a> (client-side only, no overlap)</li>
+  <li>✅ XSkills, Immersive Fibercraft, Combat Overhaul</li>
+  <li>✅ All content mods (Expanded Foods, Alchemy, Butchering, etc.)</li>
+  <li>✅ All client-side mods</li>
+</ul>
+
+<h2>Troubleshooting</h2>
+
+<p><strong>Server won't start?</strong></p>
+<ul>
+  <li>Check server logs for <code>[Synergy]</code> messages</li>
+  <li>Set all options to <code>false</code> in config, then enable one by one</li>
+</ul>
+
+<p><strong>Choppy animal movement?</strong></p>
+<ul>
+  <li>Set <code>"DistanceBasedSendFrequencyEnabled": false</code> in Synergy.json</li>
+  <li>Still choppy? Also try <code>"RepulseAgentsThrottleEnabled": false</code></li>
+</ul>
+
+<p><strong>Mod conflicts?</strong></p>
+<ul>
+  <li>Synergy auto-detects and skips conflicting patches</li>
+  <li>Check logs for <code>[Synergy] Skipping patch on...</code> messages</li>
+</ul>
+
+<h2>License</h2>
+<p>Copyright (c) 2026 Zaldaryon - All Rights Reserved</p>
+
+<p><strong>Synergy — Coordinated performance for Vintage Story servers. Every tick counts.</strong></p>

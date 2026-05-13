@@ -76,9 +76,9 @@ namespace Synergy.Server
                 // Beyond 64 blocks: skip entirely
                 if (dist > 64f) return false;
 
-                // 32-64 blocks: every 4th tick
+                // 32-64 blocks: every 2nd tick
                 int tick = Volatile.Read(ref tickCounter);
-                if (tick % 4 != 0) return false;
+                if (tick % 2 != 0) return false;
 
                 return true;
             }

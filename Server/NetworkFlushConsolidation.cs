@@ -1,27 +1,20 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
 using HarmonyLib;
 using Vintagestory.API.Server;
 
 namespace Synergy.Server
 {
     /// <summary>
-    /// Batch small TCP packets into fewer network frames.
-    /// Patches TcpNetConnection.Send to buffer small uncompressed packets,
-    /// then flushes all buffers at end-of-tick via a postfix on ServerMain.Process().
-    /// High-priority packets (compressed or large) flush immediately.
-    /// Vanilla behavior preserved: same data sent, same header format, same async path.
+    /// Batch small TCP packets into a single SendAsync call per connection per tick.
+    /// Each buffered packet is written as [4-byte header][payload] into a consolidated buffer.
+    /// On flush (end-of-tick or buffer >= MTU), one SendAsync emits all accumulated bytes
+    /// as a single TCP segment — reducing per-packet syscall overhead and TCP segment count.
     ///
-    /// Design follows the industry-standard flush-at-end-of-tick pattern used by:
-    /// - Netty FlushConsolidationHandler (buffer during read, flush at channelReadComplete)
-    /// - Minecraft Paper (write during tick, single flush at end)
-    /// - Source Engine (collect state changes, send snapshot at end of tick)
-    /// - Gaffer on Games (send after simulation step completes)
-    ///
-    /// The VS server tick loop runs: Systems.OnServerTick → EventManager.TriggerGameTick → ProcessMain.
-    /// ProcessMain handles client packets (inventory moves, slot activations) which generate response
-    /// packets. A postfix on Process() ensures these are flushed in the same tick, not the next one.
+    /// Large or compressed packets flush the buffer first (preserving order) then go direct.
     /// </summary>
     public static class NetworkFlushConsolidation
     {
@@ -30,24 +23,37 @@ namespace Synergy.Server
         private static bool disabled;
         private const int MtuThreshold = 1400;
 
-        // Cached reflection
         private static object enumOk;
-
-        // IL-emitted delegate via DynamicMethod (skipVisibility:true) — bypasses
-        // Delegate.CreateDelegate limitation with internal types. Near-native call speed.
-        private delegate void FastSendDelegate(object instance, byte[] data, bool compressed);
-        private static FastSendDelegate vanillaSendFast;
         private static AccessTools.FieldRef<object, bool> connectedRef;
+        private static AccessTools.FieldRef<object, Socket> tcpSocketRef;
+        private static AccessTools.FieldRef<object, CancellationTokenSource> ctsRef;
 
         [ThreadStatic] private static bool flushing;
 
         private static readonly ConcurrentDictionary<object, BufferState> connectionBuffers = new();
 
-        private class BufferState
+        private sealed class BufferState
         {
-            public readonly List<byte[]> pendingPackets = new();
-            public int totalBytes;
+            public byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
+            public int writePos;
             public readonly object syncLock = new();
+
+            public void EnsureCapacity(int additionalBytes)
+            {
+                int need = writePos + additionalBytes;
+                if (need <= buffer.Length) return;
+                int newSize = buffer.Length;
+                while (newSize < need) newSize *= 2;
+                var newBuf = ArrayPool<byte>.Shared.Rent(newSize);
+                Buffer.BlockCopy(buffer, 0, newBuf, 0, writePos);
+                ArrayPool<byte>.Shared.Return(buffer);
+                buffer = newBuf;
+            }
+
+            public void Reset()
+            {
+                writePos = 0;
+            }
         }
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
@@ -63,9 +69,6 @@ namespace Synergy.Server
                 return;
             }
 
-            // IL-emitted delegate via DynamicMethod — bypasses Delegate.CreateDelegate
-            // limitation with internal return types (EnumSendResult). skipVisibility:true
-            // allows calling methods on internal types from another assembly.
             var vanillaSendMethod = AccessTools.Method(tcpConnType, "Send",
                 new[] { typeof(byte[]), typeof(bool) });
             if (vanillaSendMethod == null)
@@ -74,21 +77,15 @@ namespace Synergy.Server
                 return;
             }
 
-            var dm = new System.Reflection.Emit.DynamicMethod(
-                "Synergy_FastSend", typeof(void),
-                new[] { typeof(object), typeof(byte[]), typeof(bool) },
-                typeof(NetworkFlushConsolidation), skipVisibility: true);
-            var il = dm.GetILGenerator();
-            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
-            il.Emit(System.Reflection.Emit.OpCodes.Castclass, tcpConnType);
-            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_1);
-            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_2);
-            il.Emit(System.Reflection.Emit.OpCodes.Callvirt, vanillaSendMethod);
-            il.Emit(System.Reflection.Emit.OpCodes.Pop); // discard EnumSendResult
-            il.Emit(System.Reflection.Emit.OpCodes.Ret);
-            vanillaSendFast = (FastSendDelegate)dm.CreateDelegate(typeof(FastSendDelegate));
-
             connectedRef = AccessTools.FieldRefAccess<bool>(tcpConnType, "Connected");
+            tcpSocketRef = AccessTools.FieldRefAccess<Socket>(tcpConnType, "TcpSocket");
+            ctsRef = AccessTools.FieldRefAccess<CancellationTokenSource>(tcpConnType, "cts");
+
+            if (tcpSocketRef == null || ctsRef == null)
+            {
+                api.Logger.Warning("[Synergy] NetworkFlush: Could not find Socket/CTS fields, skipping");
+                return;
+            }
 
             var enumType = AccessTools.TypeByName("Vintagestory.Common.EnumSendResult")
                 ?? AccessTools.TypeByName("Vintagestory.Server.Network.EnumSendResult");
@@ -101,9 +98,6 @@ namespace Synergy.Server
             harmony.Patch(vanillaSendMethod,
                 prefix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Prefix_Send)));
 
-            // Flush at end-of-tick via postfix on ServerMain.Process()
-            // This ensures packets from ProcessMain (inventory interactions) are flushed
-            // in the same tick they're generated, not delayed to the next tick.
             var serverMainType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
             var processMethod = serverMainType != null
                 ? AccessTools.Method(serverMainType, "Process", Type.EmptyTypes)
@@ -114,7 +108,7 @@ namespace Synergy.Server
             {
                 harmony.Patch(processMethod,
                     postfix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Postfix_Process)));
-                api.Logger.Notification("[Synergy] NetworkFlush: Network flush consolidation active (end-of-tick flush)");
+                api.Logger.Notification("[Synergy] NetworkFlush: Network flush consolidation active (true consolidation)");
             }
             else
             {
@@ -128,6 +122,7 @@ namespace Synergy.Server
 
             try
             {
+                // Large or compressed packets: flush buffer first (preserve order), then let vanilla send
                 if (data.Length > MtuThreshold || compressedFlag)
                 {
                     FlushConnection(__instance);
@@ -137,17 +132,23 @@ namespace Synergy.Server
                 var state = connectionBuffers.GetOrAdd(__instance, _ => new BufferState());
                 lock (state.syncLock)
                 {
-                    state.pendingPackets.Add(data);
-                    state.totalBytes += data.Length;
+                    int packetSize = 4 + data.Length; // 4-byte header + payload
+                    state.EnsureCapacity(packetSize);
 
-                    if (state.totalBytes >= MtuThreshold)
-                    {
+                    // Write vanilla header: length | (compressed ? 1<<31 : 0)
+                    int header = data.Length; // uncompressed, top bit = 0
+                    state.buffer[state.writePos++] = (byte)(header >> 24);
+                    state.buffer[state.writePos++] = (byte)(header >> 16);
+                    state.buffer[state.writePos++] = (byte)(header >> 8);
+                    state.buffer[state.writePos++] = (byte)header;
+                    Buffer.BlockCopy(data, 0, state.buffer, state.writePos, data.Length);
+                    state.writePos += data.Length;
+
+                    if (state.writePos >= MtuThreshold)
                         FlushConnectionLocked(__instance, state);
-                    }
                 }
 
-                if (enumOk != null)
-                    __result = enumOk;
+                if (enumOk != null) __result = enumOk;
                 return false;
             }
             catch (Exception ex)
@@ -165,14 +166,35 @@ namespace Synergy.Server
         {
             if (disabled) return;
             FlushAll();
+
+            // Periodic cleanup of disconnected connections (every 256 ticks)
+            if ((++flushTickCounter & 0xFF) == 0)
+                PurgeDisconnected();
+        }
+
+        private static int flushTickCounter;
+
+        private static void PurgeDisconnected()
+        {
+            foreach (var kvp in connectionBuffers)
+            {
+                if (connectedRef != null && !connectedRef(kvp.Key))
+                {
+                    if (connectionBuffers.TryRemove(kvp.Key, out var state))
+                    {
+                        lock (state.syncLock)
+                        {
+                            ArrayPool<byte>.Shared.Return(state.buffer);
+                        }
+                    }
+                }
+            }
         }
 
         public static void FlushAll()
         {
             foreach (var kvp in connectionBuffers)
-            {
                 FlushConnection(kvp.Key);
-            }
         }
 
         private static void FlushConnection(object connection)
@@ -186,30 +208,33 @@ namespace Synergy.Server
 
         private static void FlushConnectionLocked(object connection, BufferState state)
         {
-            if (state.pendingPackets.Count == 0) return;
+            if (state.writePos == 0) return;
+
+            if (connectedRef != null && !connectedRef(connection))
+            {
+                state.Reset();
+                connectionBuffers.TryRemove(connection, out _);
+                return;
+            }
+
+            var socket = tcpSocketRef(connection);
+            var cts = ctsRef(connection);
+            if (socket == null || cts == null)
+            {
+                state.Reset();
+                return;
+            }
+
+            // Copy to a right-sized array — SendAsync is fire-and-forget,
+            // we cannot reuse the pooled buffer until the syscall completes.
+            var payload = new byte[state.writePos];
+            Buffer.BlockCopy(state.buffer, 0, payload, 0, state.writePos);
+            state.Reset();
 
             try
             {
-                if (connectedRef != null && !connectedRef(connection))
-                {
-                    state.pendingPackets.Clear();
-                    state.totalBytes = 0;
-                    connectionBuffers.TryRemove(connection, out _);
-                    return;
-                }
-
                 flushing = true;
-                try
-                {
-                    foreach (var packet in state.pendingPackets)
-                    {
-                        vanillaSendFast(connection, packet, false);
-                    }
-                }
-                finally
-                {
-                    flushing = false;
-                }
+                socket.SendAsync(payload, SocketFlags.None, cts.Token);
             }
             catch (Exception ex)
             {
@@ -217,14 +242,20 @@ namespace Synergy.Server
             }
             finally
             {
-                state.pendingPackets.Clear();
-                state.totalBytes = 0;
+                flushing = false;
             }
         }
 
         public static void Cleanup()
         {
             FlushAll();
+            foreach (var kvp in connectionBuffers)
+            {
+                lock (kvp.Value.syncLock)
+                {
+                    ArrayPool<byte>.Shared.Return(kvp.Value.buffer);
+                }
+            }
             connectionBuffers.Clear();
         }
     }

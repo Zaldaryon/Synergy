@@ -53,12 +53,6 @@ namespace Synergy
                 count++;
             }
 
-            if (Config.BlockTickPoolingEnabled)
-            {
-                BlockTickPooling.Initialize(sapi, harmony);
-                count++;
-            }
-
             if (Config.NetworkFlushConsolidationEnabled)
             {
                 NetworkFlushConsolidation.Initialize(sapi, harmony);
@@ -134,10 +128,41 @@ namespace Synergy
                 previousLatencyMode = GCSettings.LatencyMode;
                 GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
                 sapi.Logger.Notification("[Synergy] GC latency mode: {0} → SustainedLowLatency", previousLatencyMode);
+
+                // Heap monitor: every 5 min, trigger background Gen2 if heap exceeds threshold
+                sapi.Event.RegisterGameTickListener(_ => MonitorHeap(sapi), 300000);
             }
             catch (Exception ex)
             {
                 sapi.Logger.Warning("[Synergy] Could not set GC latency mode: {0}", ex.Message);
+            }
+        }
+
+        private const long HeapWarnBytes = 4L * 1024 * 1024 * 1024;      // 4 GB
+        private const long HeapForceGcBytes = 8L * 1024 * 1024 * 1024;   // 8 GB
+
+        private void MonitorHeap(ICoreServerAPI sapi)
+        {
+            try
+            {
+                var info = GC.GetGCMemoryInfo();
+                long heap = info.HeapSizeBytes;
+
+                if (heap > HeapForceGcBytes)
+                {
+                    sapi.Logger.Warning("[Synergy] Heap {0:N0} MB exceeds threshold — triggering background Gen2 GC.",
+                        heap / 1048576);
+                    GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
+                }
+                else if (heap > HeapWarnBytes)
+                {
+                    sapi.Logger.Notification("[Synergy] Heap {0:N0} MB (warning threshold). Fragmented: {1:N0} MB.",
+                        heap / 1048576, info.FragmentedBytes / 1048576);
+                }
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Debug("[Synergy] Heap monitor error: {0}", ex.Message);
             }
         }
 

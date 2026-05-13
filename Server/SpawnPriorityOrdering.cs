@@ -19,6 +19,8 @@ namespace Synergy.Server
         private static int errorCount;
         private static bool disabled;
 
+        [ThreadStatic] private static List<(object item, double distSq)> sortBuffer;
+
         // IL-emitted fast accessors via Harmony — FieldRef<object, F> for internal types
         private static AccessTools.FieldRef<object, System.Collections.IList> clientListRef;
         private static AccessTools.FieldRef<object, System.Collections.IList> nowInRangeRef;
@@ -76,9 +78,10 @@ namespace Synergy.Server
                 var clientList = clientListRef(__instance);
                 if (clientList == null || clientList.Count == 0) return;
 
-                // Copy to avoid "Collection was modified" if another mod/thread modifies ClientList
                 var clients = new object[clientList.Count];
                 clientList.CopyTo(clients, 0);
+
+                sortBuffer ??= new List<(object, double)>(64);
 
                 foreach (var client in clients)
                 {
@@ -93,30 +96,33 @@ namespace Synergy.Server
 
                     var playerPos = player.Entity.Pos.XYZ;
 
-                    var sortList = new List<(object item, double distSq)>(nowInRange.Count);
+                    sortBuffer.Clear();
+                    if (sortBuffer.Capacity < nowInRange.Count)
+                        sortBuffer.Capacity = nowInRange.Count;
+
                     foreach (var item in nowInRange)
                     {
                         var entity = entityRef(item);
                         if (entity == null)
                         {
-                            sortList.Add((item, 0));
+                            sortBuffer.Add((item, 0));
                             continue;
                         }
                         double dx = entity.Pos.X - playerPos.X;
                         double dy = entity.Pos.Y - playerPos.Y;
                         double dz = entity.Pos.Z - playerPos.Z;
-                        sortList.Add((item, dx * dx + dy * dy + dz * dz));
+                        sortBuffer.Add((item, dx * dx + dy * dy + dz * dz));
                     }
 
                     // Farthest-first: client LIFO stack inverts → nearest processed first
-                    sortList.Sort((a, b) => b.distSq.CompareTo(a.distSq));
+                    sortBuffer.Sort((a, b) => b.distSq.CompareTo(a.distSq));
 
                     nowInRange.Clear();
-                    foreach (var (item, _) in sortList)
-                    {
-                        nowInRange.Add(item);
-                    }
+                    for (int i = 0; i < sortBuffer.Count; i++)
+                        nowInRange.Add(sortBuffer[i].item);
                 }
+
+                sortBuffer.Clear();
             }
             catch (Exception ex)
             {
