@@ -38,7 +38,8 @@ namespace Synergy.Server
             "deaddecay",
             "grow",
             "multiply",
-            "harvestable"
+            // "harvestable" removed — behavior has ThreadSafe=true, lives in ServerBehaviorsThreadsafe
+            // (ticked by PhysicsManager on physics thread), never found in ServerBehaviorsMainThread.
         };
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
@@ -176,8 +177,9 @@ namespace Synergy.Server
             if (entity.AlwaysActive) return true;
             if (entity is EntityPlayer) return true;
             if (entity.NearestPlayerDistance <= activationRange) return true;
-            // Entities in lava or on fire must full-tick for ignition/damage/extinguishing logic
+            // Entities in hazardous environments must full-tick so they can react (move, flee, swim)
             if (entity.InLava || entity.IsOnFire) return true;
+            if (entity.Swimming || entity.FeetInLiquid) return true;
             return false;
         }
 

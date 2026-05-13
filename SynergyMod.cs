@@ -1,6 +1,7 @@
 using System;
 using System.Runtime;
 using HarmonyLib;
+using Synergy.Client;
 using Synergy.Server;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -16,6 +17,8 @@ namespace Synergy
 
         private Harmony harmony;
         private ICoreAPI api;
+        private SynergyChannelManager channelManager;
+        private DeltaPositionHandler deltaHandler;
 
         public override bool ShouldLoad(EnumAppSide forSide) => true;
 
@@ -23,6 +26,17 @@ namespace Synergy
         {
             api = capi;
             Config = SynergyConfig.Load(capi);
+
+            harmony = new Harmony(HarmonyId);
+
+            if (Config.EntityLoadBudgetingEnabled)
+            {
+                EntityLoadBudgeting.Initialize(capi, harmony);
+            }
+
+            deltaHandler = new DeltaPositionHandler(capi);
+            deltaHandler.Initialize();
+
             capi.Logger.Notification("[Synergy] Client-side loaded");
         }
 
@@ -30,11 +44,14 @@ namespace Synergy
         {
             api = sapi;
             Config ??= SynergyConfig.Load(sapi);
-            harmony = new Harmony(HarmonyId);
+            harmony ??= new Harmony(HarmonyId);
 
             sapi.Logger.Notification("[Synergy] Server-side initializing...");
 
-            // Runtime tuning — benefits the entire server process
+            // Metrics
+            SynergyMetrics.Initialize(sapi);
+
+            // Runtime tuning
             if (Config.GcDiagnosticsEnabled)
             {
                 LogGcDiagnostics(sapi);
@@ -47,15 +64,15 @@ namespace Synergy
 
             int count = 0;
 
-            if (Config.InventoryDirtyScanEnabled)
-            {
-                InventoryDirtyScan.Initialize(sapi, harmony);
-                count++;
-            }
-
             if (Config.BlockTickPoolingEnabled)
             {
                 BlockTickPooling.Initialize(sapi, harmony);
+                count++;
+            }
+
+            if (Config.InventoryDirtyScanEnabled)
+            {
+                InventoryDirtyScan.Initialize(sapi, harmony);
                 count++;
             }
 
@@ -119,6 +136,28 @@ namespace Synergy
                 count++;
             }
 
+            if (Config.AiBrainThrottleEnabled)
+            {
+                AiBrainThrottle.Initialize(sapi, harmony);
+                count++;
+            }
+
+            if (Config.SaveOptimizationEnabled)
+            {
+                SaveOptimization.Initialize(sapi, harmony);
+                count++;
+            }
+
+            // Network channel (required for DeltaEncoding)
+            channelManager = new SynergyChannelManager(sapi);
+            channelManager.Initialize();
+
+            if (Config.DeltaEncodingEnabled)
+            {
+                DeltaPositionEncoding.Initialize(sapi, harmony, channelManager);
+                count++;
+            }
+
             sapi.Logger.Notification("[Synergy] Server-side loaded ({0} optimizations active)", count);
 
             var command = new SynergyCommand(sapi, Config);
@@ -134,10 +173,40 @@ namespace Synergy
                 previousLatencyMode = GCSettings.LatencyMode;
                 GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
                 sapi.Logger.Notification("[Synergy] GC latency mode: {0} → SustainedLowLatency", previousLatencyMode);
+
+                sapi.Event.RegisterGameTickListener(_ => MonitorHeap(sapi), 300000);
             }
             catch (Exception ex)
             {
                 sapi.Logger.Warning("[Synergy] Could not set GC latency mode: {0}", ex.Message);
+            }
+        }
+
+        private const long HeapWarnBytes = 4L * 1024 * 1024 * 1024;
+        private const long HeapForceGcBytes = 8L * 1024 * 1024 * 1024;
+
+        private void MonitorHeap(ICoreServerAPI sapi)
+        {
+            try
+            {
+                var info = GC.GetGCMemoryInfo();
+                long heap = info.HeapSizeBytes;
+
+                if (heap > HeapForceGcBytes)
+                {
+                    sapi.Logger.Warning("[Synergy] Heap {0:N0} MB exceeds threshold — triggering background Gen2 GC.",
+                        heap / 1048576);
+                    GC.Collect(2, GCCollectionMode.Optimized, blocking: false, compacting: true);
+                }
+                else if (heap > HeapWarnBytes)
+                {
+                    sapi.Logger.Notification("[Synergy] Heap {0:N0} MB (warning threshold). Fragmented: {1:N0} MB.",
+                        heap / 1048576, info.FragmentedBytes / 1048576);
+                }
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Debug("[Synergy] Heap monitor error: {0}", ex.Message);
             }
         }
 
@@ -164,13 +233,16 @@ namespace Synergy
         {
             try
             {
-                // Restore GC latency mode
                 if (Config?.GcSustainedLowLatencyEnabled == true)
                 {
                     GCSettings.LatencyMode = previousLatencyMode;
                 }
 
                 NetworkFlushConsolidation.Cleanup();
+                EntityLoadBudgeting.Cleanup();
+                channelManager?.Dispose();
+                deltaHandler?.Dispose();
+                SynergyMetrics.Dispose();
                 harmony?.UnpatchAll(HarmonyId);
             }
             catch (Exception ex)
@@ -182,6 +254,8 @@ namespace Synergy
                 harmony = null;
                 Config = null;
                 api = null;
+                channelManager = null;
+                deltaHandler = null;
             }
         }
     }

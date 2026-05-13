@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -70,7 +71,7 @@ namespace Synergy.Server
             }
             catch (Exception ex)
             {
-                if (++errorCount >= 5)
+                if (Interlocked.Increment(ref errorCount) >= 5)
                 {
                     disabled = true;
                     sapi?.Logger.Warning("[Synergy] CollisionFastPath: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);

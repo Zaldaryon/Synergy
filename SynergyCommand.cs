@@ -8,14 +8,14 @@ namespace Synergy
     public class SynergyCommand
     {
         private readonly ICoreServerAPI api;
-        private readonly SynergyConfig config;
+
+        private static SynergyConfig Config => SynergyMod.Config;
 
         private static readonly (string key, string label, System.Func<SynergyConfig, bool> get, System.Action<SynergyConfig, bool> set)[] toggles =
         {
             ("activationrange",  "Entity Activation Range",     c => c.EntityActivationRangeEnabled,          (c, v) => c.EntityActivationRangeEnabled = v),
             ("collisionfastpath", "Collision Fast-Path",         c => c.CollisionFastPathEnabled,              (c, v) => c.CollisionFastPathEnabled = v),
             ("networkflush",     "Network Flush Consolidation",  c => c.NetworkFlushConsolidationEnabled,      (c, v) => c.NetworkFlushConsolidationEnabled = v),
-            ("blocktickpool",    "Block Tick Pooling",           c => c.BlockTickPoolingEnabled,               (c, v) => c.BlockTickPoolingEnabled = v),
             ("inventoryscan",    "Inventory Dirty Scan",         c => c.InventoryDirtyScanEnabled,             (c, v) => c.InventoryDirtyScanEnabled = v),
             ("pathfindingpool",  "Pathfinding Node Pooling",     c => c.PathfindingOptimizationsEnabled,       (c, v) => c.PathfindingOptimizationsEnabled = v),
             ("pathfindingthrottle", "Pathfinding Throttle",      c => c.PathfindingThrottleEnabled,            (c, v) => c.PathfindingThrottleEnabled = v),
@@ -29,7 +29,6 @@ namespace Synergy
         public SynergyCommand(ICoreServerAPI api, SynergyConfig config)
         {
             this.api = api;
-            this.config = config;
         }
 
         public void Register()
@@ -64,15 +63,15 @@ namespace Synergy
         private TextCommandResult ShowStatus()
         {
             var sb = new StringBuilder();
-            sb.AppendLine("=== Synergy v1.0.0 ===");
+            sb.AppendLine($"=== Synergy v{api.ModLoader.GetMod("synergy")?.Info?.Version ?? "?"} ===");
 
             sb.AppendLine("Server Performance:");
             foreach (var (key, label, get, _) in toggles)
             {
-                sb.AppendLine($"  {key}: {(get(config) ? "ON" : "OFF")}");
+                sb.AppendLine($"  {key}: {(get(Config) ? "ON" : "OFF")}");
             }
 
-            sb.AppendLine($"  activation-range: {config.EntityActivationRangeBlocks} blocks");
+            sb.AppendLine($"  activation-range: {Config.EntityActivationRangeBlocks} blocks");
 
             return TextCommandResult.Success(sb.ToString());
         }
@@ -83,9 +82,9 @@ namespace Synergy
             bool enable = action == "on";
 
             foreach (var (_, _, _, set) in toggles)
-                set(config, enable);
+                set(Config, enable);
 
-            config.Save(api);
+            Config.Save(api);
             return TextCommandResult.Success(
                 $"All optimizations set to {(enable ? "ON" : "OFF")}.\n⚠️ Server restart required.");
         }
@@ -95,8 +94,8 @@ namespace Synergy
             string action = (string)args.Parsers[0].GetValue();
             bool enable = action == "on";
 
-            set(config, enable);
-            config.Save(api);
+            set(Config, enable);
+            Config.Save(api);
 
             return TextCommandResult.Success(
                 $"{key}: {(enable ? "ON" : "OFF")}.\n⚠️ Server restart required.");

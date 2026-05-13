@@ -1,3 +1,4 @@
+using System.Threading;
 using System;
 using System.Collections.Concurrent;
 using HarmonyLib;
@@ -132,7 +133,7 @@ namespace Synergy.Server
             }
             catch (Exception ex)
             {
-                if (++errorCount >= 5)
+                if (Interlocked.Increment(ref errorCount) >= 5)
                 {
                     disabled = true;
                     sapi?.Logger.Warning("[Synergy] BlockTickPooling: Auto-disabled after {0} errors: {1}", errorCount, ex.Message);

@@ -7,7 +7,7 @@ namespace Synergy
     {
         // Server-side performance
         public bool BlockTickPoolingEnabled { get; set; } = true;
-        public bool NetworkFlushConsolidationEnabled { get; set; } = true;
+        public bool NetworkFlushConsolidationEnabled { get; set; } = false;
         public bool InventoryDirtyScanEnabled { get; set; } = true;
         public bool EntityActivationRangeEnabled { get; set; } = true;
         public float EntityActivationRangeBlocks { get; set; } = 48f;
@@ -15,12 +15,16 @@ namespace Synergy
         public bool PathfindingOptimizationsEnabled { get; set; } = true;
         public bool PathfindingThrottleEnabled { get; set; } = true;
         public bool RepulseAgentsThrottleEnabled { get; set; } = true;
+        public bool AiBrainThrottleEnabled { get; set; } = true;
+        public bool SaveOptimizationEnabled { get; set; } = true;
 
         // Server-client fluidity
         public bool EntityTrackingHysteresisEnabled { get; set; } = true;
         public bool DistanceBasedSendFrequencyEnabled { get; set; } = true;
         public bool AttributeSyncResyncPreventionEnabled { get; set; } = true;
         public bool EntitySpawnPriorityOrderingEnabled { get; set; } = true;
+        public bool DeltaEncodingEnabled { get; set; } = true;
+        public bool EntityLoadBudgetingEnabled { get; set; } = true;
 
         // Runtime tuning
         public bool GcSustainedLowLatencyEnabled { get; set; } = true;
