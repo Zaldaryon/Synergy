@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Config;
@@ -18,9 +19,10 @@ namespace Synergy.Server
     public static class EntityActivationRange
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private static float activationRange = 48f;
+        private static HashSet<string> excludedEntityCodes;
 
         // IL-emitted fast accessors via Harmony
         private delegate void FastDespawnDelegate(object server, Entity entity, EntityDespawnData data);
@@ -42,12 +44,24 @@ namespace Synergy.Server
             // (ticked by PhysicsManager on physics thread), never found in ServerBehaviorsMainThread.
         };
 
+        // When no players are online, skip whitelisted ticks entirely.
+        // This prevents sleeping entity behaviors (breathe reads blocks) from
+        // keeping chunks "fresh" via lastReadOrWrite, which blocks chunk unloading
+        // and causes infinite loops in mods like Farseer that rely on ChunkColumnLoaded events.
+        // All whitelisted behaviors are calendar-based or non-observable without players.
+        private static bool noPlayersOnline;
+
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
             sapi = api;
             errorCount = 0;
             disabled = false;
             activationRange = SynergyMod.Config?.EntityActivationRangeBlocks ?? 48f;
+
+            var exclusions = SynergyMod.Config?.ActivationRangeExcludedEntities;
+            excludedEntityCodes = exclusions != null && exclusions.Length > 0
+                ? new HashSet<string>(exclusions, StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             var targetType = AccessTools.TypeByName("Vintagestory.Server.ServerSystemEntitySimulation");
             if (targetType == null)
@@ -100,6 +114,8 @@ namespace Synergy.Server
                 prefix: new HarmonyMethod(typeof(EntityActivationRange), nameof(Prefix_TickEntities)));
 
             api.Logger.Notification("[Synergy] ActivationRange: Entity activation range optimization active (range: {0} blocks)", activationRange);
+            if (excludedEntityCodes.Count > 0)
+                api.Logger.Notification("[Synergy] ActivationRange: Excluded entities (always full-tick): {0}", string.Join(", ", excludedEntityCodes));
         }
 
         public static bool Prefix_TickEntities(float dt, object __instance, object ___server)
@@ -111,11 +127,14 @@ namespace Synergy.Server
                 var loadedEntities = loadedEntitiesRef?.Invoke(___server);
                 if (loadedEntities == null) return true;
 
+                noPlayersOnline = sapi.World.AllOnlinePlayers.Length == 0;
+
                 // FrameProfilerUtil is public — direct access, zero reflection
                 var profiler = frameProfilerRef?.Invoke();
                 profiler?.Enter("tickentities");
 
                 var despawnList = new List<KeyValuePair<Entity, EntityDespawnData>>();
+                int activeCount = 0, sleepingCount = 0;
 
                 foreach (Entity entity in loadedEntities.Values)
                 {
@@ -127,10 +146,15 @@ namespace Synergy.Server
                         if (ShouldFullTick(entity))
                         {
                             entity.OnGameTick(dt);
+                            DiagActivationRange.OnFullTick();
+                            activeCount++;
                         }
                         else
                         {
-                            TickWhitelistedBehaviors(entity, dt);
+                            if (!noPlayersOnline)
+                                TickWhitelistedBehaviors(entity, dt);
+                            DiagActivationRange.OnSleeping();
+                            sleepingCount++;
                         }
                     }
                     catch (Exception ex)
@@ -148,6 +172,8 @@ namespace Synergy.Server
                 }
 
                 profiler?.Enter("despawning");
+
+                SynergyMetrics.SetEntityCounts(activeCount, sleepingCount);
 
                 foreach (var kvp in despawnList)
                 {
@@ -180,6 +206,8 @@ namespace Synergy.Server
             // Entities in hazardous environments must full-tick so they can react (move, flee, swim)
             if (entity.InLava || entity.IsOnFire) return true;
             if (entity.Swimming || entity.FeetInLiquid) return true;
+            // Config-driven exclusion for mod entities that require continuous ticking (e.g. smoke dissipation)
+            if (excludedEntityCodes.Count > 0 && entity.Code != null && excludedEntityCodes.Contains(entity.Code.Path)) return true;
             return false;
         }
 
@@ -205,6 +233,7 @@ namespace Synergy.Server
                     try
                     {
                         behavior.OnGameTick(dt);
+                        DiagActivationRange.OnWhitelistedTick();
                     }
                     catch (Exception ex)
                     {

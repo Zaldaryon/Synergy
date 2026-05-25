@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -29,8 +30,8 @@ namespace Synergy.Server
     public static class DistanceSendFrequency
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private const double FastMotionThresholdSq = 0.001; // ~0.03 blocks/tick — any real movement
         private static int frameCounter;
 
@@ -107,26 +108,32 @@ namespace Synergy.Server
                         !(entity.AnimManager?.AnimationsDirty ?? false) &&
                         entity.Pos.BasicallySameAs(entity.PreviousServerPos))
                     {
+                        DiagSendFrequency.OnStationarySuppressed();
                         return false;
                     }
+                    DiagSendFrequency.OnSent();
                     return true;
                 }
 
                 // Distance throttle: only for distant tracked entities (50-128 blocks)
-                if (entity.IsTracked != 1) return true;
+                if (entity.IsTracked != 1) { DiagSendFrequency.OnSent(); return true; }
 
                 // Fast-moving entities always send
                 var motion = entity.Pos.Motion;
                 if (motion.X * motion.X + motion.Y * motion.Y + motion.Z * motion.Z > FastMotionThresholdSq)
-                    return true;
+                { DiagSendFrequency.OnSent(); return true; }
 
                 // Per-entity phase throttle: use EntityId parity as phase offset.
                 // Each entity alternates independently, avoiding synchronized bursts.
                 long framePhase = Volatile.Read(ref frameCounter) & 1L;
                 long entityPhase = entity.EntityId & 1L;
                 if (entityPhase != framePhase)
+                {
+                    DiagSendFrequency.OnDistanceThrottled();
                     return false;
+                }
 
+                DiagSendFrequency.OnSent();
                 return true;
             }
             catch (Exception ex)

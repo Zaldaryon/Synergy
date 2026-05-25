@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -16,8 +17,8 @@ namespace Synergy.Server
     public static class TrackingHysteresis
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private const double MinBufferBlocks = 8.0;
         private const double SpeedMultiplier = 20.0;
 
@@ -136,6 +137,11 @@ namespace Synergy.Server
                     {
                         toKeep.Add(i);
                         trackedEntities?.Add(entityId);
+                        DiagTrackingHysteresis.OnKept();
+                    }
+                    else
+                    {
+                        DiagTrackingHysteresis.OnDespawned();
                     }
                 }
 

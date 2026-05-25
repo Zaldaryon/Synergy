@@ -8,7 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
-- Current version: `1.1.8`
+- Current version: `1.1.12`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
@@ -129,14 +129,12 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
    - Client interpolation handles variable rates via `tickDiff` in position packets
    - **Impact:** ~30-40% bandwidth reduction for distant entities. Visually identical at 50+ blocks.
 
-13. **Attribute Sync Delta Updates** (`AttributeSyncResyncPreventionEnabled`)
+13. **Attribute Sync No-Op Removal Skip** (`AttributeSyncResyncPreventionEnabled`)
    - Patches `SyncedTreeAttribute.RemoveAttribute(string)` — prefix
-   - Vanilla calls `MarkAllDirty()` on every `RemoveAttribute` — triggers full attribute tree resync (500-2000 bytes)
-   - Mod calls `base.RemoveAttribute(key)` then adds key to `attributePathsDirty` directly
-   - Avoids triggering modified listeners (matching vanilla's `MarkAllDirty` which also suppresses them)
-   - Client receives deletion via `PartialUpdate(path, null)` → `DeleteAttributeByPath(path)`
-   - Fallback: next full sync (every 5s) corrects any inconsistency
-   - **Impact:** Saves 500-2000 bytes per `RemoveAttribute` event. Adds up with many entities.
+   - Vanilla calls `MarkAllDirty()` on every `RemoveAttribute` — even when the key doesn't exist (no-op)
+   - Mod skips the call entirely when the attribute is absent, avoiding unnecessary full tree resync
+   - When the attribute DOES exist, vanilla runs normally (full resync required for client listener notification)
+   - **Impact:** Saves 500-2000 bytes per no-op `RemoveAttribute` event. Common with entity behavior cleanup.
 
 14. **Entity Spawn Priority Ordering** (`EntitySpawnPriorityOrderingEnabled`)
    - Patches `PhysicsManager.SendTrackedEntitiesStateChanges()` — prefix
@@ -211,6 +209,7 @@ Edit `Synergy.json` in your `ModConfig` folder. All optimizations are individual
   "InventoryDirtyScanEnabled": true,
   "EntityActivationRangeEnabled": true,
   "EntityActivationRangeBlocks": 48.0,
+  "ActivationRangeExcludedEntities": ["smoke"],
   "CollisionFastPathEnabled": true,
   "PathfindingOptimizationsEnabled": true,
   "PathfindingThrottleEnabled": true,

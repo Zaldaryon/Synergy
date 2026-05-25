@@ -2,6 +2,7 @@ using System.Threading;
 using System;
 using System.Collections.Concurrent;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
@@ -17,8 +18,8 @@ namespace Synergy.Server
     public static class BlockTickPooling
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         [ThreadStatic] private static BlockPos[] posPool;
         [ThreadStatic] private static int poolIndex;
@@ -92,9 +93,11 @@ namespace Synergy.Server
                 var pos = posPool[poolIndex++];
                 pos.Set(source.X, source.Y, source.Z);
                 pos.SetDimension(source.dimension);
+                DiagBlockTickPooling.OnPooled();
                 return pos;
             }
 
+            DiagBlockTickPooling.OnFallback();
             return source.Copy();
         }
 

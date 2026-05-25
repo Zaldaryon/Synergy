@@ -11,6 +11,7 @@ namespace Synergy
         public bool InventoryDirtyScanEnabled { get; set; } = true;
         public bool EntityActivationRangeEnabled { get; set; } = true;
         public float EntityActivationRangeBlocks { get; set; } = 48f;
+        public string[] ActivationRangeExcludedEntities { get; set; } = new[] { "smoke" };
         public bool CollisionFastPathEnabled { get; set; } = true;
         public bool PathfindingOptimizationsEnabled { get; set; } = true;
         public bool PathfindingThrottleEnabled { get; set; } = true;

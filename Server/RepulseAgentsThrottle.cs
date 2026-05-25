@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -29,8 +30,8 @@ namespace Synergy.Server
     public static class RepulseAgentsThrottle
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private static int tickCounter;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
@@ -71,15 +72,16 @@ namespace Synergy.Server
                 float dist = entity.NearestPlayerDistance;
 
                 // Close entities: always run (vanilla behavior)
-                if (dist < 32f) return true;
+                if (dist < 32f) { DiagRepulseThrottle.OnTicked(); return true; }
 
                 // Beyond 64 blocks: skip entirely
-                if (dist > 64f) return false;
+                if (dist > 64f) { DiagRepulseThrottle.OnSkipped(); return false; }
 
                 // 32-64 blocks: every 2nd tick
                 int tick = Volatile.Read(ref tickCounter);
-                if (tick % 2 != 0) return false;
+                if (tick % 2 != 0) { DiagRepulseThrottle.OnSkipped(); return false; }
 
+                DiagRepulseThrottle.OnTicked();
                 return true;
             }
             catch (Exception ex)

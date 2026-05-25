@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Synergy.Network;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -31,8 +32,8 @@ namespace Synergy.Server
     {
         private static ICoreServerAPI sapi;
         private static SynergyChannelManager channelManager;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         private const int MaxEntitiesPerBatch = 8;
         private const int MaxEntitiesPerBatchAbsolute = 3; // Absolute packets are larger; 3 × ~107 = ~321 bytes (safe under 508)
@@ -288,12 +289,17 @@ namespace Synergy.Server
                             int batchSize = Math.Min(batchLimit, deltaCount - i);
                             reusableBatch.Data = DeltaCodec.Encode(deltaBuffer, i, batchSize);
                             channelManager.SendDeltaBatch(reusableBatch, player);
+                            DiagDeltaEncoding.OnDeltaBatch(reusableBatch.Data.Length);
+                            DiagDeltaEncoding.OnVanillaEquivBytes(batchSize * 107);
                         }
                     }
 
                     // Send vanilla positions (for non-delta clients, or when player is null)
                     if (vanillaPosList.Count > 0)
+                    {
                         SendVanillaPositions(udpNetwork, clientObj, vanillaPosList);
+                        DiagDeltaEncoding.OnVanillaBatch(vanillaPosList.Count * 107);
+                    }
 
                     // Animations (vanilla path, all clients)
                     if (animList.Count > 0 && animChannel != null && sendBulkAnimMethod != null && player != null)

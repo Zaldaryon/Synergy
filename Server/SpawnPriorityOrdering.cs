@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -16,8 +17,8 @@ namespace Synergy.Server
     public static class SpawnPriorityOrdering
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         [ThreadStatic] private static List<(object item, double distSq)> sortBuffer;
 
@@ -120,6 +121,8 @@ namespace Synergy.Server
                     nowInRange.Clear();
                     for (int i = 0; i < sortBuffer.Count; i++)
                         nowInRange.Add(sortBuffer[i].item);
+
+                    DiagSpawnPriority.OnSort(sortBuffer.Count);
                 }
 
                 sortBuffer.Clear();

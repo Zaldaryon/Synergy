@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
@@ -16,8 +17,8 @@ namespace Synergy.Server
     public static class CollisionFastPath
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -55,18 +56,19 @@ namespace Synergy.Server
                 if (entity is EntityPlayer) return true;
 
                 var motion = entityPos.Motion;
-                if (motion.X != 0 || motion.Y != 0 || motion.Z != 0) return true;
+                if (motion.X != 0 || motion.Y != 0 || motion.Z != 0) { DiagCollisionFastPath.OnVanilla(); return true; }
 
-                if (entity.FeetInLiquid) return true;
-                if (entity.Swimming) return true;
-                if (entity.InLava) return true;
-                if (entity.IsOnFire) return true;
+                if (entity.FeetInLiquid) { DiagCollisionFastPath.OnVanilla(); return true; }
+                if (entity.Swimming) { DiagCollisionFastPath.OnVanilla(); return true; }
+                if (entity.InLava) { DiagCollisionFastPath.OnVanilla(); return true; }
+                if (entity.IsOnFire) { DiagCollisionFastPath.OnVanilla(); return true; }
 
                 // Match vanilla behavior: with zero motion, both flags are always set to false
                 entity.CollidedVertically = false;
                 entity.CollidedHorizontally = false;
 
                 newPosition.Set(entityPos.X, entityPos.Y, entityPos.Z);
+                DiagCollisionFastPath.OnSkipped();
                 return false;
             }
             catch (Exception ex)

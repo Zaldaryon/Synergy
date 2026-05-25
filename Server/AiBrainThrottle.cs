@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -32,8 +33,8 @@ namespace Synergy.Server
     public static class AiBrainThrottle
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private static int tickCounter;
 
         private const int Divisor = 512;   // dist²/512: 22 blocks = freq 1, 32 = freq 2, 45 = freq 4
@@ -125,7 +126,10 @@ namespace Synergy.Server
                          emStates.IsInEmotionState("aggressiveondamage") ||
                          emStates.IsInEmotionState("fleeondamage") ||
                          emStates.IsInEmotionState("fleealarmondamage")))
+                    {
+                        DiagAiBrainThrottle.OnCombatBypass();
                         return true;
+                    }
                 }
 
                 // DEAR formula: freq = clamp(1, maxFreq, dist² / divisor)
@@ -141,10 +145,12 @@ namespace Synergy.Server
                 {
                     // Throttled: only run ProcessRunningTasks (active tasks continue)
                     processRunningTasks(__instance, dt);
+                    DiagAiBrainThrottle.OnThrottled();
                     SynergyMetrics.RecordAiTick(true);
                     return false; // Skip original (which would also call StartNewTasks)
                 }
 
+                DiagAiBrainThrottle.OnFullTick();
                 SynergyMetrics.RecordAiTick(false);
                 return true; // Full tick — StartNewTasks + ProcessRunningTasks
             }

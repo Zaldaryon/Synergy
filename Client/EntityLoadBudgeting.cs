@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -25,8 +26,8 @@ namespace Synergy.Client
     public static class EntityLoadBudgeting
     {
         private static ICoreClientAPI capi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         private const int MaxEntitiesPerTick = 5;
 
@@ -211,6 +212,8 @@ namespace Synergy.Client
                     if (game.EntityLoadQueue.Count == 0)
                         despawnedWhileQueued.Clear();
                 }
+
+                DiagEntityLoadBudget.OnProcessed(processed);
             }
             catch (Exception ex)
             {

@@ -4,29 +4,32 @@ using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Server;
 
 namespace Synergy.Server
 {
     /// <summary>
     /// Batch small TCP packets into a single SendAsync call per connection per tick.
-    /// Each buffered packet is written as [4-byte header][payload] into a consolidated buffer.
-    /// On flush (end-of-tick or buffer >= MTU), one SendAsync emits all accumulated bytes
-    /// as a single TCP segment — reducing per-packet syscall overhead and TCP segment count.
     ///
-    /// Large or compressed packets flush the buffer first (preserving order) then go direct.
+    /// In 1.22, the hot path is HiPerformanceSend → PreparePacketForSending → SendPreparedBytes.
+    /// The legacy Send(byte[], bool) is rarely called. We patch SendPreparedBytes which receives
+    /// a pre-formatted buffer (4 bytes header space + payload) and writes the length header in-place.
+    ///
+    /// Consolidation: buffer multiple SendPreparedBytes calls into one TCP segment, flush at
+    /// end-of-tick or when buffer exceeds MTU.
     /// </summary>
     public static class NetworkFlushConsolidation
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private const int MtuThreshold = 1400;
 
-        private static object enumOk;
         private static AccessTools.FieldRef<object, bool> connectedRef;
         private static AccessTools.FieldRef<object, Socket> tcpSocketRef;
         private static AccessTools.FieldRef<object, CancellationTokenSource> ctsRef;
+        private static object enumOk;
 
         [ThreadStatic] private static bool flushing;
 
@@ -69,11 +72,12 @@ namespace Synergy.Server
                 return;
             }
 
-            var vanillaSendMethod = AccessTools.Method(tcpConnType, "Send",
-                new[] { typeof(byte[]), typeof(bool) });
-            if (vanillaSendMethod == null)
+            // Patch SendPreparedBytes — this is the actual hot path in 1.22+
+            var sendPreparedBytes = AccessTools.Method(tcpConnType, "SendPreparedBytes",
+                new[] { typeof(byte[]), typeof(int), typeof(bool) });
+            if (sendPreparedBytes == null)
             {
-                api.Logger.Warning("[Synergy] NetworkFlush: Could not find TcpNetConnection.Send, skipping");
+                api.Logger.Warning("[Synergy] NetworkFlush: Could not find SendPreparedBytes, skipping");
                 return;
             }
 
@@ -87,17 +91,17 @@ namespace Synergy.Server
                 return;
             }
 
-            var enumType = AccessTools.TypeByName("Vintagestory.Common.EnumSendResult")
-                ?? AccessTools.TypeByName("Vintagestory.Server.Network.EnumSendResult");
+            var enumType = AccessTools.TypeByName("Vintagestory.Common.EnumSendResult");
             if (enumType != null)
                 enumOk = Enum.Parse(enumType, "Ok");
 
-            if (!ConflictDetector.IsSafeToPatch(vanillaSendMethod, SynergyMod.HarmonyId, api.Logger))
+            if (!ConflictDetector.IsSafeToPatch(sendPreparedBytes, SynergyMod.HarmonyId, api.Logger))
                 return;
 
-            harmony.Patch(vanillaSendMethod,
-                prefix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Prefix_Send)));
+            harmony.Patch(sendPreparedBytes,
+                prefix: new HarmonyMethod(typeof(NetworkFlushConsolidation), nameof(Prefix_SendPreparedBytes)));
 
+            // Also patch ServerMain.Process for end-of-tick flush
             var serverMainType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
             var processMethod = serverMainType != null
                 ? AccessTools.Method(serverMainType, "Process", Type.EmptyTypes)
@@ -116,39 +120,50 @@ namespace Synergy.Server
             }
         }
 
-        public static bool Prefix_Send(object __instance, byte[] data, bool compressedFlag, ref object __result)
+        /// <summary>
+        /// Prefix on SendPreparedBytes(byte[] dataWithLength, int length, bool compressedFlag).
+        /// dataWithLength has 4 bytes header space at start, followed by payload.
+        /// Total send size = length + 4 bytes.
+        /// </summary>
+        public static bool Prefix_SendPreparedBytes(object __instance,
+            byte[] dataWithLength, int length, bool compressedFlag,
+            ref object __result)
         {
-            if (disabled || flushing || data == null || data.Length == 0) return true;
+            if (disabled || flushing || dataWithLength == null || length <= 0) return true;
 
             try
             {
+                int totalSize = length + 4;
+
                 // Large or compressed packets: flush buffer first (preserve order), then let vanilla send
-                if (data.Length > MtuThreshold || compressedFlag)
+                if (totalSize > MtuThreshold || compressedFlag)
                 {
                     FlushConnection(__instance);
+                    DiagNetworkFlush.OnPassthrough();
                     return true;
                 }
+
+                // Write the header that vanilla would write
+                int header = length | (compressedFlag ? (1 << 31) : 0);
+                dataWithLength[0] = (byte)(header >> 24);
+                dataWithLength[1] = (byte)(header >> 16);
+                dataWithLength[2] = (byte)(header >> 8);
+                dataWithLength[3] = (byte)header;
 
                 var state = connectionBuffers.GetOrAdd(__instance, _ => new BufferState());
                 lock (state.syncLock)
                 {
-                    int packetSize = 4 + data.Length; // 4-byte header + payload
-                    state.EnsureCapacity(packetSize);
-
-                    // Write vanilla header: length | (compressed ? 1<<31 : 0)
-                    int header = data.Length; // uncompressed, top bit = 0
-                    state.buffer[state.writePos++] = (byte)(header >> 24);
-                    state.buffer[state.writePos++] = (byte)(header >> 16);
-                    state.buffer[state.writePos++] = (byte)(header >> 8);
-                    state.buffer[state.writePos++] = (byte)header;
-                    Buffer.BlockCopy(data, 0, state.buffer, state.writePos, data.Length);
-                    state.writePos += data.Length;
+                    state.EnsureCapacity(totalSize);
+                    Buffer.BlockCopy(dataWithLength, 0, state.buffer, state.writePos, totalSize);
+                    state.writePos += totalSize;
 
                     if (state.writePos >= MtuThreshold)
                         FlushConnectionLocked(__instance, state);
                 }
 
+                // Return EnumSendResult.Ok
                 if (enumOk != null) __result = enumOk;
+                DiagNetworkFlush.OnBuffered(totalSize);
                 return false;
             }
             catch (Exception ex)
@@ -167,7 +182,6 @@ namespace Synergy.Server
             if (disabled) return;
             FlushAll();
 
-            // Periodic cleanup of disconnected connections (every 256 ticks)
             if ((++flushTickCounter & 0xFF) == 0)
                 PurgeDisconnected();
         }
@@ -225,11 +239,11 @@ namespace Synergy.Server
                 return;
             }
 
-            // Copy to a right-sized array — SendAsync is fire-and-forget,
-            // we cannot reuse the pooled buffer until the syscall completes.
             var payload = new byte[state.writePos];
             Buffer.BlockCopy(state.buffer, 0, payload, 0, state.writePos);
             state.Reset();
+
+            DiagNetworkFlush.OnFlush();
 
             try
             {

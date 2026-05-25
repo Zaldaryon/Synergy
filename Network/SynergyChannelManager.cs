@@ -129,11 +129,13 @@ namespace Synergy
             bool delta = (state.Capabilities & SynergyHandshake.CapDeltaEncoding) != 0;
             sapi.Logger.Notification("[Synergy] Handshake: {0} v{1} (delta={2})",
                 player.PlayerName, packet.Version, delta);
+            SynergyMetrics.SetDeltaClients(ClientCount);
         }
 
         private void OnPlayerDisconnect(IServerPlayer player)
         {
             clients.TryRemove(player.PlayerUID, out _);
+            SynergyMetrics.SetDeltaClients(ClientCount);
         }
 
         public ClientState GetDeltaClient(string playerUid)

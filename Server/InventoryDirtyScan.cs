@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 
@@ -15,8 +16,8 @@ namespace Synergy.Server
     public static class InventoryDirtyScan
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private static int anyDirtyFlag;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
@@ -88,8 +89,12 @@ namespace Synergy.Server
             try
             {
                 if (Volatile.Read(ref anyDirtyFlag) == 0)
+                {
+                    DiagInventoryDirtyScan.OnSkipped();
                     return false;
+                }
                 Volatile.Write(ref anyDirtyFlag, 0);
+                DiagInventoryDirtyScan.OnScanned();
                 return true;
             }
             catch (Exception ex)

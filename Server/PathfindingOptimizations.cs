@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
@@ -26,8 +27,8 @@ namespace Synergy.Server
     public static class PathfindingOptimizations
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
 
         // Per-thread PathNode pool — reset at start of each FindPathOrEscapePath call
         [ThreadStatic] private static PathNode[] nodePool;
@@ -99,6 +100,7 @@ namespace Synergy.Server
                         nodePool[i] = new PathNode(dummyPos);
                 }
                 nodePoolIndex = 0;
+                DiagPathfindingPool.OnSearchStart();
             }
             catch
             {
@@ -213,10 +215,12 @@ namespace Synergy.Server
                     node.hCost = 0;
                     node.Parent = null;
                     node.pathLength = 0;
+                    DiagPathfindingPool.OnPooled();
                     return node;
                 }
                 catch { /* fall through to vanilla allocation */ }
             }
+            DiagPathfindingPool.OnFallback();
             return new PathNode(parent, card);
         }
 
@@ -237,10 +241,12 @@ namespace Synergy.Server
                     node.hCost = 0;
                     node.Parent = null;
                     node.pathLength = 0;
+                    DiagPathfindingPool.OnPooled();
                     return node;
                 }
                 catch { /* fall through to vanilla allocation */ }
             }
+            DiagPathfindingPool.OnFallback();
             return new PathNode(pos);
         }
 

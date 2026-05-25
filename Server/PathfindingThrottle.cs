@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using HarmonyLib;
+using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 using Vintagestory.Essentials;
@@ -28,8 +29,8 @@ namespace Synergy.Server
     public static class PathfindingThrottle
     {
         private static ICoreServerAPI sapi;
-        private static int errorCount;
-        private static bool disabled;
+        internal static int errorCount;
+        internal static bool disabled;
         private static int tickCounter;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
@@ -82,7 +83,7 @@ namespace Synergy.Server
                 }
 
                 // Close entities: always accept (< 32 blocks = 1024 distSq)
-                if (minDistSq < 1024 || minDistSq == double.MaxValue) return true;
+                if (minDistSq < 1024 || minDistSq == double.MaxValue) { DiagPathfindingThrottle.OnAccepted(); return true; }
 
                 // Throttle: skip proportional to distance
                 // freq = distSq / 2048, clamped to [1, 8]
@@ -93,9 +94,11 @@ namespace Synergy.Server
                     // Skip this request — mark as finished with no path
                     task.waypoints = null;
                     task.Finished = true;
+                    DiagPathfindingThrottle.OnThrottled();
                     return false;
                 }
 
+                DiagPathfindingThrottle.OnAccepted();
                 return true;
             }
             catch (Exception ex)

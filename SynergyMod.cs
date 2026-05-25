@@ -2,6 +2,7 @@ using System;
 using System.Runtime;
 using HarmonyLib;
 using Synergy.Client;
+using Synergy.Diagnostics;
 using Synergy.Server;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -149,8 +150,32 @@ namespace Synergy
 
             sapi.Logger.Notification("[Synergy] Server-side loaded ({0} optimizations active)", count);
 
+            RegisterDiagModules(sapi);
+
             var command = new SynergyCommand(sapi, Config);
             command.Register();
+        }
+
+        private static void RegisterDiagModules(ICoreServerAPI api)
+        {
+            DiagRegistry.Clear();
+            DiagRegistry.Initialize(api);
+            DiagRegistry.Register(new DiagActivationRange());
+            DiagRegistry.Register(new DiagCollisionFastPath());
+            DiagRegistry.Register(new DiagNetworkFlush());
+            DiagRegistry.Register(new DiagBlockTickPooling());
+            DiagRegistry.Register(new DiagInventoryDirtyScan());
+            DiagRegistry.Register(new DiagPathfindingPool());
+            DiagRegistry.Register(new DiagPathfindingThrottle());
+            DiagRegistry.Register(new DiagRepulseThrottle());
+            DiagRegistry.Register(new DiagAiBrainThrottle());
+            DiagRegistry.Register(new DiagTrackingHysteresis());
+            DiagRegistry.Register(new DiagSendFrequency());
+            DiagRegistry.Register(new DiagAttributeSync());
+            DiagRegistry.Register(new DiagSpawnPriority());
+            DiagRegistry.Register(new DiagEntityLoadBudget());
+            DiagRegistry.Register(new DiagDeltaEncoding());
+            DiagRegistry.Register(new DiagGc());
         }
 
         private static void LogGcDiagnostics(ICoreServerAPI sapi)
@@ -181,6 +206,7 @@ namespace Synergy
                 channelManager?.Dispose();
                 deltaHandler?.Dispose();
                 SynergyMetrics.Dispose();
+                DiagRegistry.Clear();
                 harmony?.UnpatchAll(HarmonyId);
             }
             catch (Exception ex)
