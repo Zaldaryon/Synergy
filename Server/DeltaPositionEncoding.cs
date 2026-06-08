@@ -37,6 +37,7 @@ namespace Synergy.Server
 
         private const int MaxEntitiesPerBatch = 8;
         private const int MaxEntitiesPerBatchAbsolute = 3; // Absolute packets are larger; 3 × ~107 = ~321 bytes (safe under 508)
+        private const int MaxAbsolutePerClientPerTick = 12; // Cap absolute packets per client per tick to prevent UDP storm
 
         // PhysicsManager instance field accessors
         private static AccessTools.FieldRef<object, IList> clientListRef;
@@ -226,6 +227,7 @@ namespace Synergy.Server
                     animList.Clear();
                     tagList.Clear();
                     deltaCount = 0;
+                    int absoluteCount = 0;
 
                     // Determine if this is a delta client
                     var player = ccPlayerRef(clientObj);
@@ -248,7 +250,7 @@ namespace Synergy.Server
                         {
                             CollectPackets(entity.EntityId, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
                         }
 
                         // Own player animation (vanilla: only in stateUpdateTick branch)
@@ -268,7 +270,7 @@ namespace Synergy.Server
                         {
                             CollectPackets(eid, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
                         }
                     }
 
@@ -337,14 +339,17 @@ namespace Synergy.Server
             long entityId, IDictionary posPackets, IDictionary animPackets, object tagPacketsObj,
             bool isDeltaClient, SynergyChannelManager.ClientState clientState, int generation,
             List<object> vanillaPosList, List<object> animList, List<object> tagList,
-            DeltaEntry[] deltaBuffer, ref int deltaCount)
+            DeltaEntry[] deltaBuffer, ref int deltaCount, ref int absoluteCount)
         {
             if (posPackets.Contains(entityId))
             {
                 var pkt = posPackets[entityId];
                 if (isDeltaClient && deltaCount < deltaBuffer.Length)
                 {
-                    deltaBuffer[deltaCount++] = BuildDelta(pkt, clientState, generation);
+                    deltaBuffer[deltaCount] = BuildDelta(pkt, clientState, generation, absoluteCount >= MaxAbsolutePerClientPerTick);
+                    if ((deltaBuffer[deltaCount].Flags & DeltaCodec.FlagAbsolute) != 0)
+                        absoluteCount++;
+                    deltaCount++;
                 }
                 else
                 {
@@ -366,7 +371,7 @@ namespace Synergy.Server
             }
         }
 
-        private static DeltaEntry BuildDelta(object pkt, SynergyChannelManager.ClientState clientState, int generation)
+        private static DeltaEntry BuildDelta(object pkt, SynergyChannelManager.ClientState clientState, int generation, bool budgetExhausted)
         {
             long eid = pktEntityId(pkt);
             long x = pktX(pkt);
@@ -405,9 +410,15 @@ namespace Synergy.Server
                 Flags = teleport ? DeltaCodec.FlagTeleport : (byte)0
             };
 
-            bool hasBaseline = clientState.Baselines.TryGetValue(eid, out var baseline)
-                               && baseline.Generation == generation
-                               && !teleport;
+            // Staggered baseline expiry: each entity resets once per StaggerSlots ticks.
+            // Baseline is valid when its age (generation - baseline.Generation) < StaggerSlots.
+            // When budgetExhausted AND entity has a stale baseline, force relative encoding
+            // against the stale baseline. The entity retries absolute next tick when budget allows.
+            bool baselineExists = clientState.Baselines.TryGetValue(eid, out var baseline);
+            bool baselineFresh = baselineExists
+                                 && (generation - baseline.Generation) < SynergyChannelManager.StaggerSlots;
+            bool budgetDeferred = budgetExhausted && baselineExists && !baselineFresh && !teleport;
+            bool hasBaseline = (baselineFresh || budgetDeferred) && !teleport;
 
             if (hasBaseline)
             {
@@ -429,12 +440,18 @@ namespace Synergy.Server
                 entry.Flags |= DeltaCodec.FlagAbsolute;
             }
 
-            clientState.Baselines[eid] = new SynergyChannelManager.EntityBaseline
+            // Store baseline: skip ONLY when budget-deferred (entity has stale baseline,
+            // was forced relative, needs to retry absolute next tick).
+            // All other cases (new entity absolute, fresh baseline delta, teleport absolute): store.
+            if (!budgetDeferred)
             {
-                X = x, Y = y, Z = z,
-                MotionX = mx, MotionY = my, MotionZ = mz,
-                Generation = generation
-            };
+                clientState.Baselines[eid] = new SynergyChannelManager.EntityBaseline
+                {
+                    X = x, Y = y, Z = z,
+                    MotionX = mx, MotionY = my, MotionZ = mz,
+                    Generation = generation
+                };
+            }
 
             return entry;
         }
