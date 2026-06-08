@@ -7,7 +7,7 @@
     "Zaldaryon"
   ],
   "description": "Coordinated client-server performance optimizations for Vintage Story",
-  "version": "1.1.12",
+  "version": "1.1.15",
   "requiredOnClient": false,
   "requiredOnServer": false,
   "dependencies": {

@@ -1,6 +1,7 @@
 using System.Threading;
 using System;
 using System.Collections.Concurrent;
+using System.Reflection;
 using HarmonyLib;
 using Synergy.Diagnostics;
 using Vintagestory.API.Common;
@@ -25,8 +26,8 @@ namespace Synergy.Server
         [ThreadStatic] private static int poolIndex;
         private const int PoolSize = 512;
 
-        // Cached at init
-        private static Type blockPosWithExtraType;
+        // Cached at init — ConstructorInfo is more reliable than Activator for private nested types
+        private static ConstructorInfo blockPosWithExtraCtor;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -49,7 +50,6 @@ namespace Synergy.Server
                 return;
             }
 
-            // 1.22: OnSeparateThreadTick is parameterless
             var onSepThread = AccessTools.Method(targetType, "OnSeparateThreadTick", Type.EmptyTypes);
             if (onSepThread == null)
             {
@@ -57,9 +57,18 @@ namespace Synergy.Server
                 return;
             }
 
-            // Cache the private nested type at init
-            blockPosWithExtraType = AccessTools.TypeByName(
-                "Vintagestory.Server.ServerSystemBlockSimulation+BlockPosWithExtraObject");
+            // Cache ConstructorInfo for the private nested type
+            var blockPosWithExtraType = targetType.GetNestedType("BlockPosWithExtraObject", BindingFlags.NonPublic | BindingFlags.Public);
+            if (blockPosWithExtraType != null)
+            {
+                blockPosWithExtraCtor = blockPosWithExtraType.GetConstructor(new[] { typeof(BlockPos), typeof(object) });
+            }
+
+            if (blockPosWithExtraCtor == null)
+            {
+                api.Logger.Warning("[Synergy] BlockTickPooling: Could not resolve BlockPosWithExtraObject constructor, skipping");
+                return;
+            }
 
             if (!ConflictDetector.IsSafeToPatch(tryTickBlock, SynergyMod.HarmonyId, api.Logger))
                 return;
@@ -116,19 +125,17 @@ namespace Synergy.Server
                     return false;
                 }
 
-                var pooledPos = GetPooledPos(atPos);
-
-                if (extra == null)
+                if (extra != null)
                 {
-                    ___queuedTicks.Enqueue(pooledPos);
-                }
-                else if (blockPosWithExtraType != null)
-                {
-                    ___queuedTicks.Enqueue(Activator.CreateInstance(blockPosWithExtraType, pooledPos, extra));
+                    // Extra-carrying tick: use Copy() to avoid pool race condition on dequeue,
+                    // and wrap in BlockPosWithExtraObject via cached ConstructorInfo.
+                    var posCopy = atPos.Copy();
+                    ___queuedTicks.Enqueue(blockPosWithExtraCtor.Invoke(new object[] { posCopy, extra }));
                 }
                 else
                 {
-                    ___queuedTicks.Enqueue(atPos.Copy());
+                    // No-extra tick: safe to use pooled pos (consumed same tick cycle)
+                    ___queuedTicks.Enqueue(GetPooledPos(atPos));
                 }
 
                 __result = true;

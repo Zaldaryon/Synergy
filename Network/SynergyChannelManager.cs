@@ -18,6 +18,14 @@ namespace Synergy
     /// </summary>
     public class SynergyChannelManager
     {
+        /// <summary>
+        /// Number of slots over which baseline resets are staggered.
+        /// 30 slots at 33ms/tick = ~1s full cycle (matches vanilla forceUpdate cadence).
+        /// Each tick, only entities with (EntityId % StaggerSlots == currentSlot) are invalidated,
+        /// spreading absolute packets evenly instead of a synchronized storm.
+        /// </summary>
+        public const int StaggerSlots = 30;
+
         public struct EntityBaseline
         {
             public long X, Y, Z;
@@ -37,8 +45,8 @@ namespace Synergy
         private long tickListenerId;
 
         /// <summary>
-        /// Incremented every ~1s on the main thread. Physics threads compare entity baseline
-        /// generation against this. Mismatch = send absolute and update baseline.
+        /// Incremented every tick (~33ms) on the main thread. Physics threads compare entity
+        /// baseline generation against this. Baselines with age >= StaggerSlots are stale.
         /// Volatile read/write — no lock needed.
         /// </summary>
         private int baselineGeneration;
@@ -63,30 +71,14 @@ namespace Synergy
             sapi.Event.PlayerNowPlaying += OnPlayerNowPlaying;
             sapi.Event.PlayerDisconnect += OnPlayerDisconnect;
 
-            // Bump generation every ~1s to force periodic absolute packets (matches vanilla forceUpdate).
-            // Also prune stale baselines from previous generations to prevent memory growth.
+            // Increment generation every tick (~33ms). Baselines are invalidated when
+            // (entityId % StaggerSlots) == (generation % StaggerSlots), so each entity
+            // resets once per StaggerSlots ticks (~1s). This spreads absolute packets evenly
+            // across the second instead of all firing on one tick.
             tickListenerId = sapi.Event.RegisterGameTickListener(_ =>
             {
-                int oldGen = Volatile.Read(ref baselineGeneration);
                 Interlocked.Increment(ref baselineGeneration);
-
-                // Prune baselines from generations older than the one we just retired.
-                // Safe: ConcurrentDictionary iteration tolerates concurrent modifications.
-                // Physics threads may write new baselines during pruning — those will have
-                // the new generation and won't be removed.
-                foreach (var kvp in clients)
-                {
-                    var baselines = kvp.Value.Baselines;
-                    foreach (var entry in baselines)
-                    {
-                        if (entry.Value.Generation < oldGen)
-                        {
-                            // Atomic remove only if value hasn't been updated by a physics thread
-                            ((ICollection<KeyValuePair<long, EntityBaseline>>)baselines).Remove(entry);
-                        }
-                    }
-                }
-            }, 1000);
+            }, 33);
 
             sapi.Logger.Notification("[Synergy] Channel manager initialized");
         }
@@ -144,6 +136,18 @@ namespace Synergy
                 (state.Capabilities & SynergyHandshake.CapDeltaEncoding) != 0)
                 return state;
             return null;
+        }
+
+        /// <summary>
+        /// Returns true when the entity's baseline is stale and must be sent absolute.
+        /// An entity's slot fires once per StaggerSlots ticks, distributing load evenly.
+        /// </summary>
+        public bool IsBaselineExpired(long entityId, int baselineGeneration)
+        {
+            int currentGen = BaselineGeneration;
+            int age = currentGen - baselineGeneration;
+            // Stale if older than StaggerSlots ticks (one full cycle)
+            return age >= StaggerSlots;
         }
 
         public void SendDeltaBatch(DeltaPositionBatch batch, IServerPlayer player)
