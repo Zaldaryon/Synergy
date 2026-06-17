@@ -103,15 +103,6 @@ namespace Synergy.Client
             int prevTick = entity.Attributes.GetInt("tick");
             if (delta.Tick <= prevTick) return;
 
-            // First-tick guard: when entity just spawned (tick=0), only set the tick counter
-            // without applying position. Matches vanilla's bulkPositions first-packet behavior
-            // which prevents a redundant interpolation frame from spawn position.
-            if (prevTick == 0)
-            {
-                entity.Attributes.SetInt("tick", delta.Tick);
-                return;
-            }
-
             bool isAbsolute = (delta.Flags & DeltaCodec.FlagAbsolute) != 0;
             bool teleport = (delta.Flags & DeltaCodec.FlagTeleport) != 0;
 
@@ -138,12 +129,23 @@ namespace Synergy.Client
                 absMZ = baseline.MotionZ + delta.DeltaMotionZ;
             }
 
-            // Update client baseline
+            // Always update client baseline (including first-packet).
+            // Previous bug: early return on prevTick==0 skipped this, causing desync
+            // on the next relative packet.
             baselines[delta.EntityId] = new SynergyChannelManager.EntityBaseline
             {
                 X = absX, Y = absY, Z = absZ,
                 MotionX = absMX, MotionY = absMY, MotionZ = absMZ
             };
+
+            // First-tick guard: when entity just spawned (tick=0), only set the tick counter
+            // and store baseline without applying position. Matches vanilla's bulkPositions
+            // first-packet behavior which prevents a redundant interpolation frame from spawn position.
+            if (prevTick == 0)
+            {
+                entity.Attributes.SetInt("tick", delta.Tick);
+                return;
+            }
 
             // 1. Tick attributes (before position, matching vanilla order)
             entity.Attributes.SetInt("tickDiff", Math.Min(delta.Tick - prevTick, 5));
