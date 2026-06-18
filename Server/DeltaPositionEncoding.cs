@@ -37,6 +37,7 @@ namespace Synergy.Server
 
         private const int MaxEntitiesPerBatch = 8;
         private const int MaxEntitiesPerBatchAbsolute = 3; // Absolute packets are larger; 3 × ~107 = ~321 bytes (safe under 508)
+        private const int MaxAbsolutePerClientPerTick = 12; // Cap absolute packets per client per tick to prevent UDP storm
 
         // PhysicsManager instance field accessors
         private static AccessTools.FieldRef<object, IList> clientListRef;
@@ -187,6 +188,21 @@ namespace Synergy.Server
 
             harmony.Patch(target,
                 prefix: new HarmonyMethod(typeof(DeltaPositionEncoding), nameof(Prefix_SendPositionsAndAnimations)));
+
+            // Postfix on ServerMain.DespawnEntity to prune stale baselines from all delta clients.
+            // Without this, Baselines grows unboundedly with every entity ever tracked per client
+            // (only cleared on disconnect). Short-lived entities (dropped items, projectiles) churn
+            // thousands of entries on busy servers.
+            var serverMainType = AccessTools.TypeByName("Vintagestory.Server.ServerMain");
+            var despawnMethod = serverMainType != null
+                ? AccessTools.Method(serverMainType, "DespawnEntity", new[] { typeof(Entity), typeof(EntityDespawnData) })
+                : null;
+            if (despawnMethod != null)
+            {
+                harmony.Patch(despawnMethod,
+                    postfix: new HarmonyMethod(typeof(DeltaPositionEncoding), nameof(Postfix_DespawnEntity)));
+            }
+
             api.Logger.Notification("[Synergy] DeltaEncoding: Active");
         }
 
@@ -226,6 +242,7 @@ namespace Synergy.Server
                     animList.Clear();
                     tagList.Clear();
                     deltaCount = 0;
+                    int absoluteCount = 0;
 
                     // Determine if this is a delta client
                     var player = ccPlayerRef(clientObj);
@@ -248,7 +265,7 @@ namespace Synergy.Server
                         {
                             CollectPackets(entity.EntityId, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
                         }
 
                         // Own player animation (vanilla: only in stateUpdateTick branch)
@@ -268,7 +285,7 @@ namespace Synergy.Server
                         {
                             CollectPackets(eid, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
                         }
                     }
 
@@ -333,18 +350,27 @@ namespace Synergy.Server
             }
         }
 
+        public static void Postfix_DespawnEntity(Entity entity)
+        {
+            if (disabled || channelManager == null || entity == null) return;
+            channelManager.PruneBaseline(entity.EntityId);
+        }
+
         private static void CollectPackets(
             long entityId, IDictionary posPackets, IDictionary animPackets, object tagPacketsObj,
             bool isDeltaClient, SynergyChannelManager.ClientState clientState, int generation,
             List<object> vanillaPosList, List<object> animList, List<object> tagList,
-            DeltaEntry[] deltaBuffer, ref int deltaCount)
+            DeltaEntry[] deltaBuffer, ref int deltaCount, ref int absoluteCount)
         {
             if (posPackets.Contains(entityId))
             {
                 var pkt = posPackets[entityId];
                 if (isDeltaClient && deltaCount < deltaBuffer.Length)
                 {
-                    deltaBuffer[deltaCount++] = BuildDelta(pkt, clientState, generation);
+                    deltaBuffer[deltaCount] = BuildDelta(pkt, clientState, generation, absoluteCount >= MaxAbsolutePerClientPerTick);
+                    if ((deltaBuffer[deltaCount].Flags & DeltaCodec.FlagAbsolute) != 0)
+                        absoluteCount++;
+                    deltaCount++;
                 }
                 else
                 {
@@ -366,7 +392,7 @@ namespace Synergy.Server
             }
         }
 
-        private static DeltaEntry BuildDelta(object pkt, SynergyChannelManager.ClientState clientState, int generation)
+        private static DeltaEntry BuildDelta(object pkt, SynergyChannelManager.ClientState clientState, int generation, bool budgetExhausted)
         {
             long eid = pktEntityId(pkt);
             long x = pktX(pkt);
@@ -405,9 +431,28 @@ namespace Synergy.Server
                 Flags = teleport ? DeltaCodec.FlagTeleport : (byte)0
             };
 
-            bool hasBaseline = clientState.Baselines.TryGetValue(eid, out var baseline)
-                               && baseline.Generation == generation
-                               && !teleport;
+            // Staggered absolute resync: each entity re-sends a full (absolute) packet on its
+            // own slot — when (entityId % StaggerSlots) == (generation % StaggerSlots). Exactly
+            // one slot fires per tick, so every entity resyncs once per StaggerSlots ticks (~1s)
+            // while the absolute packets stay spread across the second (no synchronized storm).
+            // This is what lets a client that lost baseline sync (a dropped or out-of-order
+            // absolute, or a re-tracked entity) recover.
+            //
+            // The previous check was age-based ((generation - baseline.Generation) < StaggerSlots),
+            // but the baseline's Generation is refreshed every tick a packet is sent (below), so a
+            // CONTINUOUSLY MOVING entity (dropped item, falling block) had age ~0 forever, was never
+            // resent absolute, and stayed invisible on any desynced client. Stationary entities
+            // self-healed via vanilla's ~1s forceUpdate packet, which is why only moving/falling
+            // entities were reported invisible.
+            bool baselineExists = clientState.Baselines.TryGetValue(eid, out var baseline);
+            bool slotResync = (eid % SynergyChannelManager.StaggerSlots)
+                              == (generation % SynergyChannelManager.StaggerSlots);
+            bool canUseBaseline = baselineExists && !slotResync && !teleport;
+            // When an absolute is wanted (new entity / slot resync / teleport) but this client's
+            // per-tick absolute budget is spent, fall back to a relative delta against the existing
+            // baseline for this tick; the entity retries absolute on its next slot.
+            bool budgetDeferred = budgetExhausted && baselineExists && !canUseBaseline && !teleport;
+            bool hasBaseline = canUseBaseline || budgetDeferred;
 
             if (hasBaseline)
             {
@@ -429,12 +474,18 @@ namespace Synergy.Server
                 entry.Flags |= DeltaCodec.FlagAbsolute;
             }
 
-            clientState.Baselines[eid] = new SynergyChannelManager.EntityBaseline
+            // Store baseline: skip ONLY when budget-deferred (entity has stale baseline,
+            // was forced relative, needs to retry absolute next tick).
+            // All other cases (new entity absolute, fresh baseline delta, teleport absolute): store.
+            if (!budgetDeferred)
             {
-                X = x, Y = y, Z = z,
-                MotionX = mx, MotionY = my, MotionZ = mz,
-                Generation = generation
-            };
+                clientState.Baselines[eid] = new SynergyChannelManager.EntityBaseline
+                {
+                    X = x, Y = y, Z = z,
+                    MotionX = mx, MotionY = my, MotionZ = mz,
+                    Generation = generation
+                };
+            }
 
             return entry;
         }

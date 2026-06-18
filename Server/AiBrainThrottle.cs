@@ -117,6 +117,9 @@ namespace Synergy.Server
                 // Players always get full AI
                 if (entity is EntityPlayer) return true;
 
+                // Mod entities with custom AI/pathfinding that breaks under throttling
+                if (ModEntityExclusions.IsExcludedMod(entity)) return true;
+
                 // Entities in combat or fleeing: full rate
                 if (entity.Alive)
                 {

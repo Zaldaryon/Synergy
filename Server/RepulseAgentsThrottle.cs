@@ -69,6 +69,9 @@ namespace Synergy.Server
                 var entity = __instance.entity;
                 if (entity == null) return true;
 
+                // Mod entities with custom separation logic that breaks under throttling
+                if (ModEntityExclusions.IsExcludedMod(entity)) return true;
+
                 float dist = entity.NearestPlayerDistance;
 
                 // Close entities: always run (vanilla behavior)

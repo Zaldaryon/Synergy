@@ -103,24 +103,15 @@ namespace Synergy.Client
             int prevTick = entity.Attributes.GetInt("tick");
             if (delta.Tick <= prevTick) return;
 
-            // First-tick guard: when entity just spawned (tick=0), only set the tick counter
-            // without applying position. Matches vanilla's bulkPositions first-packet behavior
-            // which prevents a redundant interpolation frame from spawn position.
-            if (prevTick == 0)
-            {
-                entity.Attributes.SetInt("tick", delta.Tick);
-                return;
-            }
-
             bool isAbsolute = (delta.Flags & DeltaCodec.FlagAbsolute) != 0;
             bool teleport = (delta.Flags & DeltaCodec.FlagTeleport) != 0;
 
             // Reconstruct absolute values
             long absX, absY, absZ, absMX, absMY, absMZ;
 
-            if (isAbsolute || teleport ||
-                !baselines.TryGetValue(delta.EntityId, out var baseline))
+            if (isAbsolute || teleport)
             {
+                // Absolute packet: the deltas carry the full position/motion.
                 absX = delta.DeltaX;
                 absY = delta.DeltaY;
                 absZ = delta.DeltaZ;
@@ -128,7 +119,7 @@ namespace Synergy.Client
                 absMY = delta.DeltaMotionY;
                 absMZ = delta.DeltaMotionZ;
             }
-            else
+            else if (baselines.TryGetValue(delta.EntityId, out var baseline))
             {
                 absX = baseline.X + delta.DeltaX;
                 absY = baseline.Y + delta.DeltaY;
@@ -137,13 +128,36 @@ namespace Synergy.Client
                 absMY = baseline.MotionY + delta.DeltaMotionY;
                 absMZ = baseline.MotionZ + delta.DeltaMotionZ;
             }
+            else
+            {
+                // Relative delta but we have NO baseline to reconstruct against — the
+                // absolute packet that should have seeded it was lost, arrived out of order,
+                // or belonged to a since-despawned entity. delta.DeltaX/Y/Z are tiny per-tick
+                // offsets; applying them as an absolute position would slam the entity to
+                // ~world origin (0,0,0), frustum-culling it: invisible to the client while it
+                // stays pickable near its true server position. This is the dropped-item /
+                // FallingTree invisibility. Skip and wait for the next absolute packet — the
+                // server force-sends one on this entity's stagger slot (<= StaggerSlots ticks).
+                return;
+            }
 
-            // Update client baseline
+            // Always update client baseline (including first-packet).
+            // Previous bug: early return on prevTick==0 skipped this, causing desync
+            // on the next relative packet.
             baselines[delta.EntityId] = new SynergyChannelManager.EntityBaseline
             {
                 X = absX, Y = absY, Z = absZ,
                 MotionX = absMX, MotionY = absMY, MotionZ = absMZ
             };
+
+            // First-tick guard: when entity just spawned (tick=0), only set the tick counter
+            // and store baseline without applying position. Matches vanilla's bulkPositions
+            // first-packet behavior which prevents a redundant interpolation frame from spawn position.
+            if (prevTick == 0)
+            {
+                entity.Attributes.SetInt("tick", delta.Tick);
+                return;
+            }
 
             // 1. Tick attributes (before position, matching vanilla order)
             entity.Attributes.SetInt("tickDiff", Math.Min(delta.Tick - prevTick, 5));
