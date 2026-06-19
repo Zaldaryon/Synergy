@@ -69,6 +69,11 @@ namespace Synergy.Server
             PatchPostfix(harmony, AccessTools.TypeByName("Vintagestory.Common.InventoryPlayerBackpacks"),
                 "DropAll", null);
 
+            // Safety: CraftingGrid writes dirtySlots.Add() directly without MarkSlotDirty
+            var craftGridType = AccessTools.TypeByName("Vintagestory.Common.InventoryCraftingGrid");
+            PatchPostfix(harmony, craftGridType, "FindMatchingRecipe", Type.EmptyTypes);
+            PatchPostfix(harmony, craftGridType, "ConsumeIngredients", new[] { typeof(ItemSlot) });
+
             api.Logger.Notification("[Synergy] InventoryScan: Inventory dirty scan optimization active (MarkSlotDirty + fallbacks)");
         }
 

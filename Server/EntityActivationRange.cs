@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using Synergy.Diagnostics;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Config;
 using Vintagestory.API.Server;
+using Vintagestory.GameContent;
 
 namespace Synergy.Server
 {
@@ -14,7 +17,11 @@ namespace Synergy.Server
     /// Uses entity.NearestPlayerDistance (already computed by PhysicsManager).
     /// Whitelisted behaviors (breathe, health, despawn, decay) still tick for sleeping entities.
     /// Calendar-based behaviors (growth, breeding, harvestable) catch up automatically.
-    /// Vanilla behavior preserved: all time-sensitive behaviors use Calendar.TotalHours.
+    ///
+    /// For entities with AI (taskai behavior), sleeping entities still get ProcessRunningTasks
+    /// called (without StartNewTasks) so that running tasks continue executing and their
+    /// internal timers (stuck detection, timeouts) don't corrupt. This matches Paper MC's
+    /// "inactive-goal-selector-disable" pattern: running goals continue, new goal selection stops.
     /// </summary>
     public static class EntityActivationRange
     {
@@ -31,6 +38,10 @@ namespace Synergy.Server
 
         // FrameProfilerUtil is public — use StaticFieldRefAccess for the static field, then direct method calls
         private static AccessTools.FieldRef<FrameProfilerUtil> frameProfilerRef;
+
+        // IL-emitted delegate to call AiTaskManager.ProcessRunningTasks(float) directly
+        private delegate void ProcessRunningTasksFn(object taskManager, float dt);
+        private static ProcessRunningTasksFn processRunningTasks;
 
         private static readonly HashSet<string> whitelistedBehaviors = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -105,6 +116,26 @@ namespace Synergy.Server
                 // FrameProfiler is public static FrameProfilerUtil on ServerMain
                 frameProfilerRef = AccessTools.StaticFieldRefAccess<FrameProfilerUtil>(
                     AccessTools.Field(serverMainType, "FrameProfiler"));
+            }
+
+            // Resolve AiTaskManager.ProcessRunningTasks(float) for reduced-rate AI ticking
+            var taskMgrType = typeof(AiTaskManager);
+            var prtMethod = AccessTools.Method(taskMgrType, "ProcessRunningTasks", new[] { typeof(float) });
+            if (prtMethod != null)
+            {
+                var dm = new DynamicMethod("EAR_ProcessRunningTasks", typeof(void),
+                    new[] { typeof(object), typeof(float) }, taskMgrType, true);
+                var il = dm.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Castclass, taskMgrType);
+                il.Emit(OpCodes.Ldarg_1);
+                il.Emit(OpCodes.Call, prtMethod);
+                il.Emit(OpCodes.Ret);
+                processRunningTasks = (ProcessRunningTasksFn)dm.CreateDelegate(typeof(ProcessRunningTasksFn));
+            }
+            else
+            {
+                api.Logger.Warning("[Synergy] ActivationRange: Could not resolve ProcessRunningTasks — sleeping AI maintenance disabled");
             }
 
             if (!ConflictDetector.IsSafeToPatch(tickEntities, SynergyMod.HarmonyId, api.Logger))
@@ -208,6 +239,8 @@ namespace Synergy.Server
             if (entity.Swimming || entity.FeetInLiquid) return true;
             // Config-driven exclusion for mod entities that require continuous ticking (e.g. smoke dissipation)
             if (excludedEntityCodes.Count > 0 && entity.Code != null && excludedEntityCodes.Contains(entity.Code.Path)) return true;
+            // VSVillage entities use custom AI/pathfinding that breaks under activation range sleeping
+            if (ModEntityExclusions.IsExcludedMod(entity)) return true;
             return false;
         }
 
@@ -215,11 +248,7 @@ namespace Synergy.Server
         {
             // Only tick ServerBehaviorsMainThread — ServerBehaviorsThreadsafe are ticked
             // by PhysicsManager on the physics thread, not by TickEntities
-            TickBehaviorArray(entity.ServerBehaviorsMainThread, dt);
-        }
-
-        private static void TickBehaviorArray(EntityBehavior[] behaviors, float dt)
-        {
+            var behaviors = entity.ServerBehaviorsMainThread;
             if (behaviors == null) return;
 
             for (int i = 0; i < behaviors.Length; i++)
@@ -228,7 +257,9 @@ namespace Synergy.Server
                 if (behavior == null) continue;
 
                 string name = behavior.PropertyName();
-                if (name != null && whitelistedBehaviors.Contains(name))
+                if (name == null) continue;
+
+                if (whitelistedBehaviors.Contains(name))
                 {
                     try
                     {
@@ -238,6 +269,27 @@ namespace Synergy.Server
                     catch (Exception ex)
                     {
                         sapi?.Logger.Debug("[Synergy] ActivationRange: Error in whitelisted behavior {0}: {1}", name, ex.Message);
+                    }
+                }
+                else if (name == "taskai" && processRunningTasks != null)
+                {
+                    // Reduced-rate AI tick: only ProcessRunningTasks (no StartNewTasks).
+                    // This keeps running tasks alive (ContinueExecute) so their internal
+                    // timers don't corrupt, while skipping expensive new task evaluation.
+                    // Matches Paper MC's "inactive-goal-selector-disable" pattern.
+                    try
+                    {
+                        var taskAi = behavior as EntityBehaviorTaskAI;
+                        if (taskAi != null && entity.State == EnumEntityState.Active && entity.Alive)
+                        {
+                            taskAi.PathTraverser?.OnGameTick(dt);
+                            processRunningTasks(taskAi.TaskManager, dt);
+                            DiagActivationRange.OnWhitelistedTick();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        sapi?.Logger.Debug("[Synergy] ActivationRange: Error in sleeping AI tick: {0}", ex.Message);
                     }
                 }
             }

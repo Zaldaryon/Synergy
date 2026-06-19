@@ -36,6 +36,7 @@
     <Compile Remove="Documentation/**" />
     <EmbeddedResource Remove="Documentation/**" />
     <None Remove="Documentation/**" />
+    <Compile Remove="Tests/**" />
   </ItemGroup>
 
   <ItemGroup>

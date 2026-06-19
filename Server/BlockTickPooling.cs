@@ -1,6 +1,7 @@
 using System.Threading;
 using System;
 using System.Collections.Concurrent;
+using System.Reflection;
 using HarmonyLib;
 using Synergy.Diagnostics;
 using Vintagestory.API.Common;
@@ -12,7 +13,10 @@ namespace Synergy.Server
     /// <summary>
     /// Pool BlockPos objects in random block tick loop to reduce GC pressure.
     /// Patches tryTickBlock to reuse BlockPos from a ThreadStatic pool instead of calling Copy().
-    /// Pool is pre-populated and resets index each tick cycle via OnSeparateThreadTick prefix.
+    /// Two separate pools (BlockPos and FluidBlockPos) preserve type identity for main-thread
+    /// dequeue logic which dispatches based on `is FluidBlockPos` type checks.
+    /// Pool resets only when queuedTicks is empty to prevent coordinate corruption from
+    /// overwriting in-flight entries awaiting main-thread consumption.
     /// Vanilla behavior preserved: same blocks ticked at same rate, only allocation pattern changes.
     /// </summary>
     public static class BlockTickPooling
@@ -21,12 +25,16 @@ namespace Synergy.Server
         internal static int errorCount;
         internal static bool disabled;
 
-        [ThreadStatic] private static BlockPos[] posPool;
-        [ThreadStatic] private static int poolIndex;
         private const int PoolSize = 512;
 
-        // Cached at init
-        private static Type blockPosWithExtraType;
+        [ThreadStatic] private static BlockPos[] posPool;
+        [ThreadStatic] private static int posPoolIndex;
+
+        [ThreadStatic] private static FluidBlockPos[] fluidPosPool;
+        [ThreadStatic] private static int fluidPosPoolIndex;
+
+        // Cached at init — ConstructorInfo is more reliable than Activator for private nested types
+        private static ConstructorInfo blockPosWithExtraCtor;
 
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
@@ -49,7 +57,6 @@ namespace Synergy.Server
                 return;
             }
 
-            // 1.22: OnSeparateThreadTick is parameterless
             var onSepThread = AccessTools.Method(targetType, "OnSeparateThreadTick", Type.EmptyTypes);
             if (onSepThread == null)
             {
@@ -57,9 +64,18 @@ namespace Synergy.Server
                 return;
             }
 
-            // Cache the private nested type at init
-            blockPosWithExtraType = AccessTools.TypeByName(
-                "Vintagestory.Server.ServerSystemBlockSimulation+BlockPosWithExtraObject");
+            // Cache ConstructorInfo for the private nested type
+            var blockPosWithExtraType = targetType.GetNestedType("BlockPosWithExtraObject", BindingFlags.NonPublic | BindingFlags.Public);
+            if (blockPosWithExtraType != null)
+            {
+                blockPosWithExtraCtor = blockPosWithExtraType.GetConstructor(new[] { typeof(BlockPos), typeof(object) });
+            }
+
+            if (blockPosWithExtraCtor == null)
+            {
+                api.Logger.Warning("[Synergy] BlockTickPooling: Could not resolve BlockPosWithExtraObject constructor, skipping");
+                return;
+            }
 
             if (!ConflictDetector.IsSafeToPatch(tryTickBlock, SynergyMod.HarmonyId, api.Logger))
                 return;
@@ -74,13 +90,23 @@ namespace Synergy.Server
             api.Logger.Notification("[Synergy] BlockTickPooling: Block tick pooling optimization active");
         }
 
-        public static void Prefix_OnSeparateThreadTick()
+        public static void Prefix_OnSeparateThreadTick(ConcurrentQueue<object> ___queuedTicks)
         {
-            poolIndex = 0;
+            // Only reset pools when queue is empty — pooled objects may still be awaiting
+            // main-thread consumption. Resetting while entries are in-flight overwrites
+            // their coordinates → NullReferenceException on GetBlock().
+            if (___queuedTicks == null || ___queuedTicks.IsEmpty)
+            {
+                posPoolIndex = 0;
+                fluidPosPoolIndex = 0;
+            }
         }
 
         private static BlockPos GetPooledPos(BlockPos source)
         {
+            if (source is FluidBlockPos)
+                return GetPooledFluidPos(source);
+
             if (posPool == null)
             {
                 posPool = new BlockPos[PoolSize];
@@ -88,9 +114,9 @@ namespace Synergy.Server
                     posPool[i] = new BlockPos(0);
             }
 
-            if (poolIndex < PoolSize)
+            if (posPoolIndex < PoolSize)
             {
-                var pos = posPool[poolIndex++];
+                var pos = posPool[posPoolIndex++];
                 pos.Set(source.X, source.Y, source.Z);
                 pos.SetDimension(source.dimension);
                 DiagBlockTickPooling.OnPooled();
@@ -101,34 +127,52 @@ namespace Synergy.Server
             return source.Copy();
         }
 
+        private static FluidBlockPos GetPooledFluidPos(BlockPos source)
+        {
+            if (fluidPosPool == null)
+            {
+                fluidPosPool = new FluidBlockPos[PoolSize];
+                for (int i = 0; i < PoolSize; i++)
+                    fluidPosPool[i] = new FluidBlockPos();
+            }
+
+            if (fluidPosPoolIndex < PoolSize)
+            {
+                var pos = fluidPosPool[fluidPosPoolIndex++];
+                pos.Set(source.X, source.Y, source.Z);
+                pos.SetDimension(source.dimension);
+                DiagBlockTickPooling.OnPooled();
+                return pos;
+            }
+
+            DiagBlockTickPooling.OnFallback();
+            return (FluidBlockPos)source.Copy();
+        }
+
         public static bool Prefix_tryTickBlock(Block block, BlockPos atPos,
-            ref bool __result, object ___server, Random ___rand, ConcurrentQueue<object> ___queuedTicks)
+            ref bool __result, Random ___rand, ConcurrentQueue<object> ___queuedTicks)
         {
             if (disabled) return true;
 
             try
             {
-                IWorldAccessor world = sapi.World;
-
-                if (!block.ShouldReceiveServerGameTicks(world, atPos, ___rand, out var extra))
+                if (!block.ShouldReceiveServerGameTicks(sapi.World, atPos, ___rand, out var extra))
                 {
                     __result = false;
                     return false;
                 }
 
-                var pooledPos = GetPooledPos(atPos);
-
-                if (extra == null)
+                if (extra != null)
                 {
-                    ___queuedTicks.Enqueue(pooledPos);
-                }
-                else if (blockPosWithExtraType != null)
-                {
-                    ___queuedTicks.Enqueue(Activator.CreateInstance(blockPosWithExtraType, pooledPos, extra));
+                    // Extra-carrying tick: use Copy() which preserves FluidBlockPos type,
+                    // and wrap in BlockPosWithExtraObject via cached ConstructorInfo.
+                    var posCopy = atPos.Copy();
+                    ___queuedTicks.Enqueue(blockPosWithExtraCtor.Invoke(new object[] { posCopy, extra }));
                 }
                 else
                 {
-                    ___queuedTicks.Enqueue(atPos.Copy());
+                    // No-extra tick: use type-aware pooled pos (BlockPos or FluidBlockPos)
+                    ___queuedTicks.Enqueue(GetPooledPos(atPos));
                 }
 
                 __result = true;
