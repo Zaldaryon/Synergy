@@ -136,9 +136,17 @@ namespace Synergy.Server
                 }
 
                 // DEAR formula: freq = clamp(1, maxFreq, dist² / divisor)
+                // Load-adaptive: scale divisor down under server pressure (more throttling)
                 float dist = entity.NearestPlayerDistance;
                 if (dist > 256f) return true; // Beyond any reasonable activation range — let vanilla run
-                int freq = Math.Clamp((int)(dist * dist / Divisor), 1, MaxFreq);
+
+                int effectiveDivisor = Divisor;
+                if (!EntityActivationRange.disabled && EntityActivationRange.LastTickDurationMs > EntityActivationRange.adaptiveThresholdMs)
+                {
+                    float loadScale = Math.Max(1f, EntityActivationRange.LastTickDurationMs / 50f);
+                    effectiveDivisor = Math.Max(32, (int)(Divisor / loadScale));
+                }
+                int freq = Math.Clamp((int)(dist * dist / effectiveDivisor), 1, MaxFreq);
 
                 if (freq <= 1) return true; // Close enough — full rate
 

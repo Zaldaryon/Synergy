@@ -31,6 +31,14 @@ namespace Synergy.Server
         private static float activationRange = 48f;
         private static HashSet<string> excludedEntityCodes;
 
+        // Load-adaptive throttling
+        private static readonly System.Diagnostics.Stopwatch tickStopwatch = new();
+        internal static long LastTickDurationMs = 50;
+        private static bool adaptiveEnabled = true;
+        private static float adaptiveMinBlocks = 16f;
+        internal static int adaptiveThresholdMs = 200;
+        private static int postSaveCooldown;
+
         // IL-emitted fast accessors via Harmony
         private delegate void FastDespawnDelegate(object server, Entity entity, EntityDespawnData data);
         private static FastDespawnDelegate despawnFast;
@@ -68,6 +76,9 @@ namespace Synergy.Server
             errorCount = 0;
             disabled = false;
             activationRange = SynergyMod.Config?.EntityActivationRangeBlocks ?? 48f;
+            adaptiveEnabled = SynergyMod.Config?.AdaptiveRangeEnabled ?? true;
+            adaptiveMinBlocks = SynergyMod.Config?.AdaptiveRangeMinBlocks ?? 16f;
+            adaptiveThresholdMs = SynergyMod.Config?.AdaptiveRangeThresholdMs ?? 200;
 
             var exclusions = SynergyMod.Config?.ActivationRangeExcludedEntities;
             excludedEntityCodes = exclusions != null && exclusions.Length > 0
@@ -144,6 +155,9 @@ namespace Synergy.Server
             harmony.Patch(tickEntities,
                 prefix: new HarmonyMethod(typeof(EntityActivationRange), nameof(Prefix_TickEntities)));
 
+            api.Event.GameWorldSave += () => { postSaveCooldown = 3; };
+            tickStopwatch.Start();
+
             api.Logger.Notification("[Synergy] ActivationRange: Entity activation range optimization active (range: {0} blocks)", activationRange);
             if (excludedEntityCodes.Count > 0)
                 api.Logger.Notification("[Synergy] ActivationRange: Excluded entities (always full-tick): {0}", string.Join(", ", excludedEntityCodes));
@@ -155,6 +169,25 @@ namespace Synergy.Server
 
             try
             {
+                // Measure previous tick duration for adaptive throttling
+                long elapsed = tickStopwatch.ElapsedMilliseconds;
+                if (elapsed > 0) LastTickDurationMs = elapsed;
+                tickStopwatch.Restart();
+
+                // Compute effective activation range based on server load
+                float effectiveRange = activationRange;
+                if (adaptiveEnabled && LastTickDurationMs > adaptiveThresholdMs)
+                {
+                    float loadFactor = Math.Min(1f, (float)adaptiveThresholdMs / Math.Max(50f, LastTickDurationMs));
+                    effectiveRange = Math.Max(adaptiveMinBlocks, activationRange * loadFactor);
+                }
+                if (postSaveCooldown > 0)
+                {
+                    effectiveRange *= 0.5f;
+                    effectiveRange = Math.Max(adaptiveMinBlocks, effectiveRange);
+                    postSaveCooldown--;
+                }
+
                 var loadedEntities = loadedEntitiesRef?.Invoke(___server);
                 if (loadedEntities == null) return true;
 
@@ -174,7 +207,7 @@ namespace Synergy.Server
 
                     try
                     {
-                        if (ShouldFullTick(entity))
+                        if (ShouldFullTick(entity, effectiveRange))
                         {
                             entity.OnGameTick(dt);
                             DiagActivationRange.OnFullTick();
@@ -229,11 +262,11 @@ namespace Synergy.Server
             }
         }
 
-        private static bool ShouldFullTick(Entity entity)
+        private static bool ShouldFullTick(Entity entity, float effectiveRange)
         {
             if (entity.AlwaysActive) return true;
             if (entity is EntityPlayer) return true;
-            if (entity.NearestPlayerDistance <= activationRange) return true;
+            if (entity.NearestPlayerDistance <= effectiveRange) return true;
             // Entities in hazardous environments must full-tick so they can react (move, flee, swim)
             if (entity.InLava || entity.IsOnFire) return true;
             if (entity.Swimming || entity.FeetInLiquid) return true;
