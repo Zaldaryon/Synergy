@@ -15,6 +15,8 @@ namespace Synergy.Diagnostics
         private static long fullTicks;
         private static long throttledTicks;
         private static long combatBypasses;
+        private static long feedBypasses;
+        private static long safetyBypasses;
 
         public void Enable() { enabled = true; Reset(); }
         public void Disable() { enabled = false; }
@@ -25,6 +27,8 @@ namespace Synergy.Diagnostics
             Interlocked.Exchange(ref fullTicks, 0);
             Interlocked.Exchange(ref throttledTicks, 0);
             Interlocked.Exchange(ref combatBypasses, 0);
+            Interlocked.Exchange(ref feedBypasses, 0);
+            Interlocked.Exchange(ref safetyBypasses, 0);
         }
 
         public void Dump(ICoreServerAPI api, IServerPlayer caller)
@@ -33,10 +37,12 @@ namespace Synergy.Diagnostics
             long full = Volatile.Read(ref fullTicks);
             long throttled = Volatile.Read(ref throttledTicks);
             long combat = Volatile.Read(ref combatBypasses);
+            long feed = Volatile.Read(ref feedBypasses);
+            long safety = Volatile.Read(ref safetyBypasses);
             long total = full + throttled;
             int throttlePct = total > 0 ? (int)(throttled * 100 / total) : 0;
 
-            DiagLog.Line(api, caller, $"aithrottle: full={full} throttled={throttled} ({throttlePct}% saved) combatBypass={combat} elapsed={elapsed:F1}s");
+            DiagLog.Line(api, caller, $"aithrottle: full={full} throttled={throttled} ({throttlePct}% saved) combatBypass={combat} feedBypass={feed} safetyBypass={safety} elapsed={elapsed:F1}s");
         }
 
         public static void OnFullTick()
@@ -55,6 +61,18 @@ namespace Synergy.Diagnostics
         {
             if (!enabled) return;
             Interlocked.Increment(ref combatBypasses);
+        }
+
+        public static void OnFeedBypass()
+        {
+            if (!enabled) return;
+            Interlocked.Increment(ref feedBypasses);
+        }
+
+        public static void OnSafetyBypass()
+        {
+            if (!enabled) return;
+            Interlocked.Increment(ref safetyBypasses);
         }
     }
 }
