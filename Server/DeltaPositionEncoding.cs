@@ -37,7 +37,6 @@ namespace Synergy.Server
 
         private const int MaxEntitiesPerBatch = 8;
         private const int MaxEntitiesPerBatchAbsolute = 3; // Absolute packets are larger; 3 × ~107 = ~321 bytes (safe under 508)
-        private const int MaxAbsolutePerClientPerTick = 12; // Cap absolute packets per client per tick to prevent UDP storm
 
         // PhysicsManager instance field accessors
         private static AccessTools.FieldRef<object, IList> clientListRef;
@@ -242,7 +241,6 @@ namespace Synergy.Server
                     animList.Clear();
                     tagList.Clear();
                     deltaCount = 0;
-                    int absoluteCount = 0;
 
                     // Determine if this is a delta client
                     var player = ccPlayerRef(clientObj);
@@ -265,7 +263,8 @@ namespace Synergy.Server
                         {
                             CollectPackets(entity.EntityId, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount,
+                                entity is EntityItem);
                         }
 
                         // Own player animation (vanilla: only in stateUpdateTick branch)
@@ -283,9 +282,12 @@ namespace Synergy.Server
 
                         foreach (long eid in trackedIds)
                         {
+                            // Check if entity is EntityItem — excluded from delta encoding entirely
+                            var ent = sapi.World.GetEntityById(eid);
                             CollectPackets(eid, posPackets, animPackets, tagPacketsObj,
                                 isDeltaClient, clientState, generation,
-                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount, ref absoluteCount);
+                                vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount,
+                                isEntityItem: ent is EntityItem);
                         }
                     }
 
@@ -304,7 +306,7 @@ namespace Synergy.Server
                         for (int i = 0; i < deltaCount; i += batchLimit)
                         {
                             int batchSize = Math.Min(batchLimit, deltaCount - i);
-                            reusableBatch.Data = DeltaCodec.Encode(deltaBuffer, i, batchSize);
+                            reusableBatch.Data = DeltaCodec.Encode(deltaBuffer, i, batchSize, generation);
                             channelManager.SendDeltaBatch(reusableBatch, player);
                             DiagDeltaEncoding.OnDeltaBatch(reusableBatch.Data.Length);
                             DiagDeltaEncoding.OnVanillaEquivBytes(batchSize * 107);
@@ -360,22 +362,31 @@ namespace Synergy.Server
             long entityId, IDictionary posPackets, IDictionary animPackets, object tagPacketsObj,
             bool isDeltaClient, SynergyChannelManager.ClientState clientState, int generation,
             List<object> vanillaPosList, List<object> animList, List<object> tagList,
-            DeltaEntry[] deltaBuffer, ref int deltaCount, ref int absoluteCount)
+            DeltaEntry[] deltaBuffer, ref int deltaCount, bool isEntityItem = false)
         {
             if (posPackets.Contains(entityId))
             {
                 var pkt = posPackets[entityId];
-                if (isDeltaClient && deltaCount < deltaBuffer.Length)
+                if (isDeltaClient && !isEntityItem && deltaCount < deltaBuffer.Length)
                 {
-                    deltaBuffer[deltaCount] = BuildDelta(pkt, clientState, generation, absoluteCount >= MaxAbsolutePerClientPerTick);
-                    if ((deltaBuffer[deltaCount].Flags & DeltaCodec.FlagAbsolute) != 0)
-                        absoluteCount++;
-                    deltaCount++;
+                    var track = clientState.Tracks.GetOrAdd(entityId, _ => new SynergyChannelManager.EntityTrack());
+                    if (TryBuildFromPacket(track, generation, pkt, out var entry))
+                        deltaBuffer[deltaCount++] = entry;
                 }
                 else
                 {
+                    // Non-delta client, EntityItem, or delta buffer full — vanilla absolute.
                     vanillaPosList.Add(pkt);
                 }
+            }
+            else if (isDeltaClient && !isEntityItem && deltaCount < deltaBuffer.Length
+                     && clientState.Tracks.TryGetValue(entityId, out var track) && track.HasPending)
+            {
+                // Entity left vanilla's per-tick set (went stationary) but the client hasn't acked its
+                // last position yet. Resend the cumulative delta against the acked base until it does,
+                // so a single dropped UDP packet can't leave it frozen (the reported dropped-item bug).
+                if (TryBuildResend(track, generation, entityId, out var entry))
+                    deltaBuffer[deltaCount++] = entry;
             }
 
             if (animPackets.Contains(entityId))
@@ -392,102 +403,92 @@ namespace Synergy.Server
             }
         }
 
-        private static DeltaEntry BuildDelta(object pkt, SynergyChannelManager.ClientState clientState, int generation, bool budgetExhausted)
+        private static bool TryBuildFromPacket(SynergyChannelManager.EntityTrack track, int generation, object pkt, out DeltaEntry entry)
         {
             long eid = pktEntityId(pkt);
-            long x = pktX(pkt);
-            long y = pktY(pkt);
-            long z = pktZ(pkt);
-            long mx = pktMotionX(pkt);
-            long my = pktMotionY(pkt);
-            long mz = pktMotionZ(pkt);
+            long x = pktX(pkt), y = pktY(pkt), z = pktZ(pkt);
+            long mx = pktMotionX(pkt), my = pktMotionY(pkt), mz = pktMotionZ(pkt);
             bool teleport = pktTeleport(pkt);
 
-            // Read tags from Packet_TagSetFast
             var tags = pktTags(pkt);
             long t1 = 0, t2 = 0, t3 = 0, t4 = 0;
-            if (tags != null)
-            {
-                t1 = tagPart1(tags);
-                t2 = tagPart2(tags);
-                t3 = tagPart3(tags);
-                t4 = tagPart4(tags);
-            }
+            if (tags != null) { t1 = tagPart1(tags); t2 = tagPart2(tags); t3 = tagPart3(tags); t4 = tagPart4(tags); }
 
-            var entry = new DeltaEntry
+            lock (track)
+                return BuildEntryLocked(track, generation, eid, x, y, z, mx, my, mz, teleport,
+                    pktYaw(pkt), pktPitch(pkt), pktRoll(pkt), pktHeadYaw(pkt), pktHeadPitch(pkt), pktBodyYaw(pkt),
+                    pktControls(pkt), pktTick(pkt), pktPosVersion(pkt), pktMountControls(pkt),
+                    t1, t2, t3, t4, out entry);
+        }
+
+        private static bool TryBuildResend(SynergyChannelManager.EntityTrack track, int generation, long eid, out DeltaEntry entry)
+        {
+            entry = default;
+            lock (track)
+            {
+                if (!track.HasPending) return false;
+                var s = track.Latest();
+                return BuildEntryLocked(track, generation, eid, s.X, s.Y, s.Z, s.MotionX, s.MotionY, s.MotionZ, false,
+                    track.LYaw, track.LPitch, track.LRoll, track.LHeadYaw, track.LHeadPitch, track.LBodyYaw,
+                    track.LControls, track.LTick, track.LPosVersion, track.LMountControls,
+                    track.LTags1, track.LTags2, track.LTags3, track.LTags4, out entry);
+            }
+        }
+
+        /// <summary>
+        /// Build one delta entry against the client's ACKED baseline (Quake 3 / Source model) and
+        /// record the send. Caller must hold <c>lock(track)</c>. Returns false (no entry) when the
+        /// entity's value already equals the acked baseline — the client provably has it, so nothing
+        /// is sent (ack-aware stationary suppression).
+        ///
+        /// Absolute (full) is sent when there is no acked baseline yet, on teleport, or when the
+        /// acked baseline is older than MaxBaseAge (Gaffer's "drop to absolute if the base is too old"
+        /// — also bounds delta magnitude and ring depth). Everything else is a relative delta carrying
+        /// BaseGen = AckedGen so the client reconstructs against the exact value it confirmed.
+        /// </summary>
+        private static bool BuildEntryLocked(SynergyChannelManager.EntityTrack track, int generation, long eid,
+            long x, long y, long z, long mx, long my, long mz, bool teleport,
+            int yaw, int pitch, int roll, int headYaw, int headPitch, int bodyYaw,
+            int controls, int tick, int posVer, int mountControls,
+            long t1, long t2, long t3, long t4, out DeltaEntry entry)
+        {
+            entry = default;
+
+            if (!teleport && track.AckedEquals(x, y, z, mx, my, mz))
+                return false; // fully synced — client already has this position
+
+            bool absolute = !track.HasAcked || teleport
+                            || (generation - track.AckedGen) > SynergyChannelManager.MaxBaseAge;
+
+            entry = new DeltaEntry
             {
                 EntityId = eid,
-                Yaw = pktYaw(pkt),
-                Pitch = pktPitch(pkt),
-                Roll = pktRoll(pkt),
-                HeadYaw = pktHeadYaw(pkt),
-                HeadPitch = pktHeadPitch(pkt),
-                BodyYaw = pktBodyYaw(pkt),
-                Controls = pktControls(pkt),
-                Tick = pktTick(pkt),
-                PositionVersion = pktPosVersion(pkt),
-                MountControls = pktMountControls(pkt),
+                Yaw = yaw, Pitch = pitch, Roll = roll, HeadYaw = headYaw, HeadPitch = headPitch, BodyYaw = bodyYaw,
+                Controls = controls, Tick = tick, PositionVersion = posVer, MountControls = mountControls,
                 TagsPart1 = t1, TagsPart2 = t2, TagsPart3 = t3, TagsPart4 = t4,
                 Flags = teleport ? DeltaCodec.FlagTeleport : (byte)0
             };
 
-            // Staggered absolute resync: each entity re-sends a full (absolute) packet on its
-            // own slot — when (entityId % StaggerSlots) == (generation % StaggerSlots). Exactly
-            // one slot fires per tick, so every entity resyncs once per StaggerSlots ticks (~1s)
-            // while the absolute packets stay spread across the second (no synchronized storm).
-            // This is what lets a client that lost baseline sync (a dropped or out-of-order
-            // absolute, or a re-tracked entity) recover.
-            //
-            // The previous check was age-based ((generation - baseline.Generation) < StaggerSlots),
-            // but the baseline's Generation is refreshed every tick a packet is sent (below), so a
-            // CONTINUOUSLY MOVING entity (dropped item, falling block) had age ~0 forever, was never
-            // resent absolute, and stayed invisible on any desynced client. Stationary entities
-            // self-healed via vanilla's ~1s forceUpdate packet, which is why only moving/falling
-            // entities were reported invisible.
-            bool baselineExists = clientState.Baselines.TryGetValue(eid, out var baseline);
-            bool slotResync = (eid % SynergyChannelManager.StaggerSlots)
-                              == (generation % SynergyChannelManager.StaggerSlots);
-            bool canUseBaseline = baselineExists && !slotResync && !teleport;
-            // When an absolute is wanted (new entity / slot resync / teleport) but this client's
-            // per-tick absolute budget is spent, fall back to a relative delta against the existing
-            // baseline for this tick; the entity retries absolute on its next slot.
-            bool budgetDeferred = budgetExhausted && baselineExists && !canUseBaseline && !teleport;
-            bool hasBaseline = canUseBaseline || budgetDeferred;
-
-            if (hasBaseline)
+            if (absolute)
             {
-                entry.DeltaX = x - baseline.X;
-                entry.DeltaY = y - baseline.Y;
-                entry.DeltaZ = z - baseline.Z;
-                entry.DeltaMotionX = mx - baseline.MotionX;
-                entry.DeltaMotionY = my - baseline.MotionY;
-                entry.DeltaMotionZ = mz - baseline.MotionZ;
+                entry.DeltaX = x; entry.DeltaY = y; entry.DeltaZ = z;
+                entry.DeltaMotionX = mx; entry.DeltaMotionY = my; entry.DeltaMotionZ = mz;
+                entry.BaseGen = generation;
+                entry.Flags |= DeltaCodec.FlagAbsolute;
             }
             else
             {
-                entry.DeltaX = x;
-                entry.DeltaY = y;
-                entry.DeltaZ = z;
-                entry.DeltaMotionX = mx;
-                entry.DeltaMotionY = my;
-                entry.DeltaMotionZ = mz;
-                entry.Flags |= DeltaCodec.FlagAbsolute;
+                entry.DeltaX = x - track.X; entry.DeltaY = y - track.Y; entry.DeltaZ = z - track.Z;
+                entry.DeltaMotionX = mx - track.MotionX; entry.DeltaMotionY = my - track.MotionY; entry.DeltaMotionZ = mz - track.MotionZ;
+                entry.BaseGen = track.AckedGen;
             }
 
-            // Store baseline: skip ONLY when budget-deferred (entity has stale baseline,
-            // was forced relative, needs to retry absolute next tick).
-            // All other cases (new entity absolute, fresh baseline delta, teleport absolute): store.
-            if (!budgetDeferred)
-            {
-                clientState.Baselines[eid] = new SynergyChannelManager.EntityBaseline
-                {
-                    X = x, Y = y, Z = z,
-                    MotionX = mx, MotionY = my, MotionZ = mz,
-                    Generation = generation
-                };
-            }
-
-            return entry;
+            // Record this send so an ack can promote the exact value the client held. Skip when the
+            // value is unchanged from the newest pending send (a stationary resend) — no ring growth.
+            if (!track.LatestEquals(x, y, z, mx, my, mz))
+                track.RecordSend(generation, x, y, z, mx, my, mz);
+            track.SetLastFields(yaw, pitch, roll, headYaw, headPitch, bodyYaw, controls, tick, posVer, mountControls, t1, t2, t3, t4);
+            return true;
         }
 
         private static void SendVanillaPositions(object udpNetwork, object client, List<object> posList)

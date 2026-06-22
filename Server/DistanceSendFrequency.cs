@@ -96,10 +96,11 @@ namespace Synergy.Server
                 // Players handle their own position packets via ServerUdpNetwork
                 if (entity is EntityPlayer) return true;
 
+                // EntityItem excluded — cheap entities, short-lived, client needs uninterrupted
+                // force-updates for PassivePhysics to set CollidedVertically (stops rotation).
+                if (entity is EntityItem) return true;
+
                 // Stationary suppression: skip force-update when entity hasn't moved at all.
-                // The tick counter (GetIntAndIncrement) only runs when vanilla creates a packet,
-                // so skipping here keeps tick counters correct. CompletePositionUpdate runs
-                // regardless (it's called after BuildPositionPacket in vanilla).
                 if (forceUpdate)
                 {
                     var agent = entity as EntityAgent;

@@ -47,6 +47,9 @@ namespace Synergy.Server
         // Accessor for AiTaskManager.entity field (to get NearestPlayerDistance)
         private static AccessTools.FieldRef<object, Entity> taskManagerEntityRef;
 
+        // Accessor for AiTaskManager.tasks field (to detect herd/social tasks)
+        private static AccessTools.FieldRef<object, System.Collections.Generic.List<IAiTask>> taskManagerTasksRef;
+
         public static void Initialize(ICoreServerAPI api, Harmony harmony)
         {
             sapi = api;
@@ -92,6 +95,7 @@ namespace Synergy.Server
 
             // Resolve entity field on AiTaskManager
             taskManagerEntityRef = AccessTools.FieldRefAccess<Entity>(taskMgrType, "entity");
+            taskManagerTasksRef = AccessTools.FieldRefAccess<System.Collections.Generic.List<IAiTask>>(taskMgrType, "tasks");
 
             harmony.Patch(onGameTick,
                 prefix: new HarmonyMethod(typeof(AiBrainThrottle), nameof(Prefix_OnGameTick)));
@@ -150,6 +154,27 @@ namespace Synergy.Server
 
                 if (freq <= 1) return true; // Close enough — full rate
 
+                // Animals that need to eat to breed get full-rate AI so they promptly start
+                // seeking food. ShouldEat is the exact gate vanilla's AiTaskSeekFoodAndEat uses;
+                // throttling StartNewTasks would delay the eat to well-fed to breed to generation
+                // loop that drives domestication. (Eating/birth already in progress never freezes:
+                // ProcessRunningTasks runs every tick, and the multiply birth event ticks outside
+                // the AI task system. This closes the remaining "going to eat" gap.)
+                if (WantsToFeed(entity))
+                {
+                    DiagAiBrainThrottle.OnFeedBypass();
+                    return true;
+                }
+
+                // Survival (escape water / unstrand) and social (owned pets, herd cohesion) tasks
+                // don't depend on a nearby player, so distance-throttling them is wrong: a sheep
+                // could drown, a pet ignore its owner, a herd scatter, all visible at view range.
+                if (NeedsFullRateForSafety(entity, __instance))
+                {
+                    DiagAiBrainThrottle.OnSafetyBypass();
+                    return true;
+                }
+
                 int tick = Volatile.Read(ref tickCounter);
                 // Offset by entity ID to distribute load across tick slots (prevents thundering herd)
                 if ((tick + (int)((uint)entity.EntityId % (uint)freq)) % freq != 0)
@@ -175,6 +200,38 @@ namespace Synergy.Server
                 }
                 return true;
             }
+        }
+
+        // True when the animal still needs to eat to be able to breed/lay (covers livestock via
+        // EntityBehaviorMultiply and egg-layers via EntityBehaviorMultiplyBase). Mirrors vanilla's
+        // own seek-food gate so we never delay the domestication feed loop.
+        private static bool WantsToFeed(Entity entity)
+        {
+            var multiply = entity.GetBehavior<EntityBehaviorMultiplyBase>();
+            return multiply != null && multiply.ShouldEat;
+        }
+
+        // Full-rate AI for tasks whose urgency is independent of player distance:
+        //   - survival: land/air animal stuck in water, or aquatic creature stranded on land
+        //   - pets: owned animals (come-to-owner / stay-close-to-owner)
+        //   - herd: animals with a stay-close cohesion task
+        private static bool NeedsFullRateForSafety(Entity entity, object taskManager)
+        {
+            var habitat = entity.Properties?.Habitat ?? EnumHabitat.Land;
+            bool aquatic = habitat == EnumHabitat.Sea || habitat == EnumHabitat.Underwater;
+            if (aquatic ? (entity.OnGround && !entity.Swimming) : entity.Swimming)
+                return true;
+
+            if (entity.WatchedAttributes.GetTreeAttribute("ownedby") != null)
+                return true;
+
+            var tasks = taskManagerTasksRef?.Invoke(taskManager);
+            if (tasks != null)
+                for (int i = 0; i < tasks.Count; i++)
+                    if (tasks[i] is AiTaskStayCloseToEntity)
+                        return true;
+
+            return false;
         }
     }
 }

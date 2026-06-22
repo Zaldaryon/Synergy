@@ -55,6 +55,11 @@ namespace Synergy.Server
                 // Never skip for players — client needs full collision for movement/gravity
                 if (entity is EntityPlayer) return true;
 
+                // Never skip for EntityItem — client depends on precise Y position from
+                // server collision to detect ground contact (CollidedVertically). Skipping
+                // can leave items floating by epsilon above ground, breaking renderer logic.
+                if (entity is EntityItem) return true;
+
                 var motion = entityPos.Motion;
                 if (motion.X != 0 || motion.Y != 0 || motion.Z != 0) { DiagCollisionFastPath.OnVanilla(); return true; }
 
@@ -63,7 +68,8 @@ namespace Synergy.Server
                 if (entity.InLava) { DiagCollisionFastPath.OnVanilla(); return true; }
                 if (entity.IsOnFire) { DiagCollisionFastPath.OnVanilla(); return true; }
 
-                // Match vanilla behavior: with zero motion, both flags are always set to false
+                // Match vanilla behavior: ApplyTerrainCollision with zero motion always sets
+                // both flags to false (motionY=0 → pushOutY returns 0 → collided=false).
                 entity.CollidedVertically = false;
                 entity.CollidedHorizontally = false;
 

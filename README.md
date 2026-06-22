@@ -8,7 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
-- Current version: `1.1.20`
+- Current version: `1.1.22`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
@@ -106,7 +106,9 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
    - `ProcessRunningTasks` always runs every tick via IL-emitted delegate — entities never freeze mid-action
    - Entities in combat or fleeing (aggressivearoundentities, aggressiveondamage, fleeondamage, fleealarmondamage) always get full-rate AI
    - Players always get full-rate AI
-   - Breathe, Health, and Damage are separate behaviors — not affected by this throttle
+   - Animals that need to eat to breed (EntityBehaviorMultiplyBase.ShouldEat) get full-rate AI, so the eat to breed to generation loop that drives domestication is never delayed
+   - Survival tasks (a land animal escaping water, an aquatic creature stranded on land) and social tasks (owned pets, herd cohesion via StayCloseToEntity) get full-rate AI, since their urgency does not depend on player distance
+   - Breathe, Health, and Damage are separate behaviors, not affected by this throttle
    - Reference: Airplane DEAR, Pufferfish DAB, Game AI Pro Ch.14 "LOD Trader"
    - **Impact:** ~2-5% TPS with activation range active. ~8-12% standalone.
 

@@ -10,11 +10,16 @@ using Vintagestory.API.Datastructures;
 namespace Synergy.Client
 {
     /// <summary>
-    /// Client-side handler for delta-encoded entity position packets.
-    /// Receives DeltaPositionBatch, reconstructs absolute positions, and applies
-    /// them directly to entities via public API — zero reflection, zero packet reconstruction.
+    /// Client side of the ack-based delta protocol (Quake 3 / Source model).
     ///
-    /// When connected to a vanilla server (no Synergy), this handler is never invoked.
+    /// Each batch is tagged with a snapshot generation. A relative entry carries the generation of
+    /// the baseline it was encoded against (BaseGen); the client reconstructs the absolute position
+    /// from the value it held at that generation. The client keeps a small per-entity ring of recent
+    /// values for that lookup, and periodically acks the highest generation it has received. Because
+    /// the server only ever encodes against an acked baseline and resends until acked, a lost UDP
+    /// packet costs at most a frame — there is no permanent desync.
+    ///
+    /// When connected to a vanilla / non-Synergy server this handler is never invoked.
     /// </summary>
     public class DeltaPositionHandler
     {
@@ -23,8 +28,42 @@ namespace Synergy.Client
         private IClientNetworkChannel deltaChannel;
         private bool serverHasSynergy;
 
-        // Per-entity baselines for delta reconstruction (client-side, main thread only)
-        private readonly Dictionary<long, SynergyChannelManager.EntityBaseline> baselines = new();
+        private sealed class ClientTrack
+        {
+            private SynergyChannelManager.PosSample[] ring;
+            private int head, count;
+            public int LastGen = -1;
+
+            public void Push(int gen, long x, long y, long z, long mx, long my, long mz)
+            {
+                ring ??= new SynergyChannelManager.PosSample[SynergyChannelManager.RingCapacity];
+                if (count == SynergyChannelManager.RingCapacity) { head = (head + 1) % SynergyChannelManager.RingCapacity; count--; }
+                ring[(head + count) % SynergyChannelManager.RingCapacity] = new SynergyChannelManager.PosSample
+                {
+                    Gen = gen, X = x, Y = y, Z = z, MotionX = mx, MotionY = my, MotionZ = mz
+                };
+                count++;
+            }
+
+            /// <summary>Value held at the largest stored generation ≤ baseGen (the delta base).</summary>
+            public bool TryGetBase(int baseGen, out SynergyChannelManager.PosSample sample)
+            {
+                sample = default;
+                bool found = false;
+                for (int i = 0; i < count; i++)
+                {
+                    ref var s = ref ring[(head + i) % SynergyChannelManager.RingCapacity];
+                    if (s.Gen <= baseGen && (!found || s.Gen > sample.Gen)) { sample = s; found = true; }
+                }
+                return found;
+            }
+        }
+
+        private readonly Dictionary<long, ClientTrack> tracks = new();
+        private int highestDecodedGen = -1;
+        private int lastAckedGen = -1;
+        private int ackTickCounter;
+        private long ackListenerId;
 
         public DeltaPositionHandler(ICoreClientAPI capi)
         {
@@ -35,6 +74,7 @@ namespace Synergy.Client
         {
             handshakeChannel = capi.Network.RegisterChannel("synergy")
                 .RegisterMessageType<SynergyHandshake>()
+                .RegisterMessageType<SynergyAck>()
                 .SetMessageHandler<SynergyHandshake>(OnServerHandshake);
 
             deltaChannel = capi.Network.RegisterUdpChannel("synergy-delta")
@@ -43,36 +83,54 @@ namespace Synergy.Client
 
             capi.Event.OnEntityDespawn += OnEntityDespawn;
 
+            // Send a cumulative ack every AckIntervalTicks ticks (~100ms) so the server can advance
+            // each entity's delta baseline to state we provably have.
+            ackListenerId = capi.Event.RegisterGameTickListener(_ => SendAckIfNeeded(), 33);
+
             capi.Logger.Notification("[Synergy] Client delta handler initialized");
         }
 
         public void Dispose()
         {
-            baselines.Clear();
+            tracks.Clear();
             serverHasSynergy = false;
             if (capi != null)
+            {
                 capi.Event.OnEntityDespawn -= OnEntityDespawn;
+                capi.Event.UnregisterGameTickListener(ackListenerId);
+            }
         }
 
         private void OnEntityDespawn(Entity entity, EntityDespawnData reason)
         {
-            baselines.Remove(entity.EntityId);
+            tracks.Remove(entity.EntityId);
         }
 
         private void OnServerHandshake(SynergyHandshake packet)
         {
             serverHasSynergy = true;
-            capi.Logger.Notification("[Synergy] Server handshake received (v{0}, delta={1})",
-                packet.Version, (packet.Capabilities & SynergyHandshake.CapDeltaEncoding) != 0);
+            capi.Logger.Notification("[Synergy] Server handshake received (v{0}, delta-ack={1})",
+                packet.Version, (packet.Capabilities & SynergyHandshake.CapDeltaAck) != 0);
 
             if (handshakeChannel.Connected)
             {
                 handshakeChannel.SendPacket(new SynergyHandshake
                 {
                     Version = capi.ModLoader.GetMod("synergy")?.Info?.Version ?? "unknown",
-                    Capabilities = SynergyHandshake.CapDeltaEncoding
+                    Capabilities = SynergyHandshake.CapDeltaAck
                 });
             }
+        }
+
+        private void SendAckIfNeeded()
+        {
+            if (++ackTickCounter < SynergyChannelManager.AckIntervalTicks) return;
+            ackTickCounter = 0;
+            if (highestDecodedGen == lastAckedGen || !serverHasSynergy) return;
+            if (handshakeChannel == null || !handshakeChannel.Connected) return;
+
+            lastAckedGen = highestDecodedGen;
+            handshakeChannel.SendPacket(new SynergyAck { Generation = highestDecodedGen });
         }
 
         // Reusable decode buffer (main thread only, no concurrency)
@@ -84,9 +142,12 @@ namespace Synergy.Client
 
             try
             {
-                int count = DeltaCodec.Decode(batch.Data, decodeBuffer);
+                int count = DeltaCodec.Decode(batch.Data, decodeBuffer, out int generation);
+                if (count == 0) return;
+                if (generation > highestDecodedGen) highestDecodedGen = generation;
+
                 for (int i = 0; i < count; i++)
-                    ApplyDelta(ref decodeBuffer[i]);
+                    ApplyDelta(ref decodeBuffer[i], generation);
             }
             catch (Exception ex)
             {
@@ -94,76 +155,49 @@ namespace Synergy.Client
             }
         }
 
-        private void ApplyDelta(ref DeltaEntry delta)
+        private void ApplyDelta(ref DeltaEntry delta, int generation)
         {
             Entity entity = capi.World.GetEntityById(delta.EntityId);
             if (entity == null) return;
 
-            // Stale packet check (matches vanilla HandleSinglePacket)
-            int prevTick = entity.Attributes.GetInt("tick");
-            if (delta.Tick <= prevTick) return;
+            if (!tracks.TryGetValue(delta.EntityId, out var track))
+                tracks[delta.EntityId] = track = new ClientTrack();
+
+            // Stale/reordered snapshot for this entity — we already have a newer one.
+            if (generation <= track.LastGen) return;
 
             bool isAbsolute = (delta.Flags & DeltaCodec.FlagAbsolute) != 0;
             bool teleport = (delta.Flags & DeltaCodec.FlagTeleport) != 0;
 
-            // Reconstruct absolute values
             long absX, absY, absZ, absMX, absMY, absMZ;
-
             if (isAbsolute || teleport)
             {
-                // Absolute packet: the deltas carry the full position/motion.
-                absX = delta.DeltaX;
-                absY = delta.DeltaY;
-                absZ = delta.DeltaZ;
-                absMX = delta.DeltaMotionX;
-                absMY = delta.DeltaMotionY;
-                absMZ = delta.DeltaMotionZ;
+                absX = delta.DeltaX; absY = delta.DeltaY; absZ = delta.DeltaZ;
+                absMX = delta.DeltaMotionX; absMY = delta.DeltaMotionY; absMZ = delta.DeltaMotionZ;
             }
-            else if (baselines.TryGetValue(delta.EntityId, out var baseline))
+            else if (track.TryGetBase(delta.BaseGen, out var b))
             {
-                absX = baseline.X + delta.DeltaX;
-                absY = baseline.Y + delta.DeltaY;
-                absZ = baseline.Z + delta.DeltaZ;
-                absMX = baseline.MotionX + delta.DeltaMotionX;
-                absMY = baseline.MotionY + delta.DeltaMotionY;
-                absMZ = baseline.MotionZ + delta.DeltaMotionZ;
+                absX = b.X + delta.DeltaX; absY = b.Y + delta.DeltaY; absZ = b.Z + delta.DeltaZ;
+                absMX = b.MotionX + delta.DeltaMotionX; absMY = b.MotionY + delta.DeltaMotionY; absMZ = b.MotionZ + delta.DeltaMotionZ;
             }
             else
             {
-                // Relative delta but we have NO baseline to reconstruct against — the
-                // absolute packet that should have seeded it was lost, arrived out of order,
-                // or belonged to a since-despawned entity. delta.DeltaX/Y/Z are tiny per-tick
-                // offsets; applying them as an absolute position would slam the entity to
-                // ~world origin (0,0,0), frustum-culling it: invisible to the client while it
-                // stays pickable near its true server position. This is the dropped-item /
-                // FallingTree invisibility. Skip and wait for the next absolute packet — the
-                // server force-sends one on this entity's stagger slot (<= StaggerSlots ticks).
+                // No stored baseline for this BaseGen — should not happen (the server only encodes
+                // against a generation we acked, which is within the ring). Defensive: skip and wait
+                // for the server's age-based absolute resync (within MaxBaseAge generations).
                 return;
             }
 
-            // Always update client baseline (including first-packet).
-            // Previous bug: early return on prevTick==0 skipped this, causing desync
-            // on the next relative packet.
-            baselines[delta.EntityId] = new SynergyChannelManager.EntityBaseline
-            {
-                X = absX, Y = absY, Z = absZ,
-                MotionX = absMX, MotionY = absMY, MotionZ = absMZ
-            };
+            int prevGen = track.LastGen;
+            track.Push(generation, absX, absY, absZ, absMX, absMY, absMZ);
+            track.LastGen = generation;
 
-            // First-tick guard: when entity just spawned (tick=0), only set the tick counter
-            // and store baseline without applying position. Matches vanilla's bulkPositions
-            // first-packet behavior which prevents a redundant interpolation frame from spawn position.
-            if (prevTick == 0)
-            {
-                entity.Attributes.SetInt("tick", delta.Tick);
-                return;
-            }
+            // Interpolation pacing from the snapshot cadence (replaces vanilla's per-entity tick).
+            int tickDiff = prevGen < 0 ? 1 : Math.Min(generation - prevGen, 5);
+            entity.Attributes.SetInt("tickDiff", tickDiff);
+            entity.Attributes.SetInt("tick", generation);
 
-            // 1. Tick attributes (before position, matching vanilla order)
-            entity.Attributes.SetInt("tickDiff", Math.Min(delta.Tick - prevTick, 5));
-            entity.Attributes.SetInt("tick", delta.Tick);
-
-            // 2. Position — inline deserialization: (double)v / 16384.0 and (float)v / 1024f
+            // Position — inline deserialization: (double)v / 16384.0 and (float)v / 1024f
             var pos = entity.Pos;
             pos.X = (double)absX / 16384.0;
             pos.Y = (double)absY / 16384.0;
@@ -177,7 +211,6 @@ namespace Synergy.Client
             pos.Motion.Y = (double)absMY / 16384.0;
             pos.Motion.Z = (double)absMZ / 16384.0;
 
-            // 3. Agent-specific fields
             if (entity is EntityAgent agent)
             {
                 agent.BodyYawServer = (float)delta.BodyYaw / 1024f;
@@ -186,14 +219,11 @@ namespace Synergy.Client
                     agent.ServerControls.FromInt(delta.Controls);
             }
 
-            // 4. Mount controls
             (entity.SidedProperties == null ? null :
                 entity.GetInterface<IMountable>()?.ControllingControls)?.FromInt(delta.MountControls);
 
-            // 5. Trigger interpolation chain
             entity.OnReceivedServerPos(teleport);
 
-            // 6. Tags (AFTER OnReceivedServerPos, matching vanilla order)
             entity.Tags = new TagSetFast(Vector256.Create(
                 (ulong)delta.TagsPart1, (ulong)delta.TagsPart2,
                 (ulong)delta.TagsPart3, (ulong)delta.TagsPart4));

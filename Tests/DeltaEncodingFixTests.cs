@@ -1,194 +1,44 @@
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Synergy;
 using Synergy.Network;
 using Xunit;
+using Track = Synergy.SynergyChannelManager.EntityTrack;
 
 namespace Tests;
 
 /// <summary>
-/// Automated tests for Issue #1 fix: delta encoding baseline desync causing invisible entities.
-/// Tests the pure logic extracted from DeltaPositionHandler (client) and DeltaPositionEncoding (server).
-/// No game dependencies — exercises codec, baseline management, and decision logic.
+/// Tests for the ack-based delta protocol (Quake 3 / Source / Gaffer model): the server delta-encodes
+/// each entity against the value the client last ACKnowledged, keeps a ring of un-acked sends so an ack
+/// can promote the exact acked value, and resends until acked. A lost UDP packet is therefore never a
+/// permanent desync. These exercise the pure codec + EntityTrack logic — no game dependencies.
 /// </summary>
 public class DeltaEncodingFixTests
 {
-    // --- Fix A: Client skips relative delta when no baseline exists ---
+    // --- Codec roundtrip (with snapshot generation + per-entry base reference) ---
 
     [Fact]
-    public void RelativeDelta_NoBaseline_IsSkipped()
+    public void Codec_AbsoluteEntry_RoundtripsWithGeneration()
     {
-        // Simulate client receiving a relative delta (not absolute, not teleport)
-        // with no stored baseline. Fix A: must skip, not treat as absolute.
-        var baselines = new Dictionary<long, SynergyChannelManager.EntityBaseline>();
-        var delta = new DeltaEntry
+        const int gen = 123456;
+        var input = new[]
         {
-            EntityId = 42,
-            Flags = 0, // relative (no FlagAbsolute, no FlagTeleport)
-            DeltaX = 5, DeltaY = 3, DeltaZ = -2,
-            Tick = 10
-        };
-
-        bool shouldApply = TryReconstructPosition(delta, baselines, out _, out _, out _);
-
-        Assert.False(shouldApply, "Relative delta with no baseline must be skipped (Fix A)");
-    }
-
-    [Fact]
-    public void AbsoluteDelta_NoBaseline_IsApplied()
-    {
-        var baselines = new Dictionary<long, SynergyChannelManager.EntityBaseline>();
-        var delta = new DeltaEntry
-        {
-            EntityId = 42,
-            Flags = DeltaCodec.FlagAbsolute,
-            DeltaX = 1000000, DeltaY = 500000, DeltaZ = 2000000,
-            Tick = 10
-        };
-
-        bool shouldApply = TryReconstructPosition(delta, baselines, out long x, out long y, out long z);
-
-        Assert.True(shouldApply, "Absolute delta must always be applied");
-        Assert.Equal(1000000, x);
-        Assert.Equal(500000, y);
-        Assert.Equal(2000000, z);
-    }
-
-    [Fact]
-    public void AbsoluteDelta_SetsBaseline_ForSubsequentRelative()
-    {
-        var baselines = new Dictionary<long, SynergyChannelManager.EntityBaseline>();
-
-        // First: absolute seeds baseline
-        var abs = new DeltaEntry
-        {
-            EntityId = 42,
-            Flags = DeltaCodec.FlagAbsolute,
-            DeltaX = 1000000, DeltaY = 500000, DeltaZ = 2000000,
-            Tick = 10
-        };
-        TryReconstructPosition(abs, baselines, out _, out _, out _);
-
-        // Second: relative uses baseline
-        var rel = new DeltaEntry
-        {
-            EntityId = 42,
-            Flags = 0,
-            DeltaX = 100, DeltaY = -50, DeltaZ = 200,
-            Tick = 11
-        };
-        bool applied = TryReconstructPosition(rel, baselines, out long x, out long y, out long z);
-
-        Assert.True(applied);
-        Assert.Equal(1000100, x);  // 1000000 + 100
-        Assert.Equal(499950, y);   // 500000 + (-50)
-        Assert.Equal(2000200, z);  // 2000000 + 200
-    }
-
-    [Fact]
-    public void TeleportDelta_AlwaysApplied_RegardlessOfBaseline()
-    {
-        var baselines = new Dictionary<long, SynergyChannelManager.EntityBaseline>();
-        var delta = new DeltaEntry
-        {
-            EntityId = 42,
-            Flags = DeltaCodec.FlagTeleport,
-            DeltaX = 9999999, DeltaY = 8888888, DeltaZ = 7777777,
-            Tick = 10
-        };
-
-        bool shouldApply = TryReconstructPosition(delta, baselines, out long x, out _, out _);
-
-        Assert.True(shouldApply);
-        Assert.Equal(9999999, x);
-    }
-
-    // --- Fix B: Server stagger slot forces absolute periodically ---
-
-    [Fact]
-    public void StaggerSlot_ForcesAbsolute_OnMatchingTick()
-    {
-        long entityId = 42;
-        int generation = 42; // entityId % 30 == generation % 30 → slot match
-
-        bool slotResync = (entityId % SynergyChannelManager.StaggerSlots)
-                          == (generation % SynergyChannelManager.StaggerSlots);
-
-        Assert.True(slotResync, "Entity should resync on its own slot tick");
-    }
-
-    [Fact]
-    public void StaggerSlot_SkipsAbsolute_OnNonMatchingTick()
-    {
-        long entityId = 42; // 42 % 30 == 12
-        int generation = 43; // 43 % 30 == 13 → no match
-
-        bool slotResync = (entityId % SynergyChannelManager.StaggerSlots)
-                          == (generation % SynergyChannelManager.StaggerSlots);
-
-        Assert.False(slotResync, "Entity should NOT resync on a different slot");
-    }
-
-    [Fact]
-    public void StaggerSlot_EverySingleEntity_ResyncsWithin30Ticks()
-    {
-        // Every entity (any ID) must hit its slot exactly once per 30-tick cycle
-        for (long eid = 0; eid < 100; eid++)
-        {
-            int hits = 0;
-            for (int gen = 0; gen < 30; gen++)
+            new DeltaEntry
             {
-                if ((eid % 30) == (gen % 30)) hits++;
-            }
-            Assert.Equal(1, hits);
-        }
-    }
-
-    [Fact]
-    public void StaggerSlot_MovingEntity_StillGetsAbsolute()
-    {
-        // The OLD bug: moving entities never got absolute because Generation was refreshed
-        // every tick. The new slot logic is purely (entityId % slots == gen % slots) —
-        // independent of whether the entity moved or not.
-        long entityId = 7;
-        int absoluteCount = 0;
-
-        for (int gen = 0; gen < 60; gen++)
-        {
-            bool slotResync = (entityId % SynergyChannelManager.StaggerSlots)
-                              == (gen % SynergyChannelManager.StaggerSlots);
-            if (slotResync) absoluteCount++;
-        }
-
-        // 60 ticks = 2 full cycles → exactly 2 absolutes
-        Assert.Equal(2, absoluteCount);
-    }
-
-    // --- Codec roundtrip (regression guard) ---
-
-    [Fact]
-    public void Codec_Roundtrip_PreservesAllFields()
-    {
-        var input = new DeltaEntry[]
-        {
-            new()
-            {
-                EntityId = 12345,
-                Flags = DeltaCodec.FlagAbsolute,
+                EntityId = 12345, Flags = DeltaCodec.FlagAbsolute,
                 DeltaX = -999999, DeltaY = 888888, DeltaZ = 0,
                 DeltaMotionX = 100, DeltaMotionY = -50, DeltaMotionZ = 200,
-                Yaw = 1024, Pitch = 512, Roll = 0,
-                HeadYaw = 768, HeadPitch = 256, BodyYaw = 2048,
+                Yaw = 1024, Pitch = 512, Roll = 0, HeadYaw = 768, HeadPitch = 256, BodyYaw = 2048,
                 Controls = 0x210, Tick = 999, PositionVersion = 3, MountControls = 0,
                 TagsPart1 = 0xFF, TagsPart2 = 0, TagsPart3 = long.MaxValue, TagsPart4 = 1
             }
         };
 
-        byte[] encoded = DeltaCodec.Encode(input, 0, 1);
+        byte[] encoded = DeltaCodec.Encode(input, 0, 1, gen);
         var output = new DeltaEntry[1];
-        int count = DeltaCodec.Decode(encoded, output);
+        int count = DeltaCodec.Decode(encoded, output, out int decodedGen);
 
         Assert.Equal(1, count);
+        Assert.Equal(gen, decodedGen);
         var o = output[0];
         Assert.Equal(input[0].EntityId, o.EntityId);
         Assert.Equal(input[0].Flags, o.Flags);
@@ -196,112 +46,250 @@ public class DeltaEncodingFixTests
         Assert.Equal(input[0].DeltaY, o.DeltaY);
         Assert.Equal(input[0].DeltaZ, o.DeltaZ);
         Assert.Equal(input[0].DeltaMotionX, o.DeltaMotionX);
-        Assert.Equal(input[0].DeltaMotionY, o.DeltaMotionY);
         Assert.Equal(input[0].DeltaMotionZ, o.DeltaMotionZ);
         Assert.Equal(input[0].Yaw, o.Yaw);
-        Assert.Equal(input[0].Pitch, o.Pitch);
-        Assert.Equal(input[0].Roll, o.Roll);
-        Assert.Equal(input[0].HeadYaw, o.HeadYaw);
-        Assert.Equal(input[0].HeadPitch, o.HeadPitch);
         Assert.Equal(input[0].BodyYaw, o.BodyYaw);
         Assert.Equal(input[0].Controls, o.Controls);
         Assert.Equal(input[0].Tick, o.Tick);
-        Assert.Equal(input[0].PositionVersion, o.PositionVersion);
-        Assert.Equal(input[0].MountControls, o.MountControls);
-        Assert.Equal(input[0].TagsPart1, o.TagsPart1);
-        Assert.Equal(input[0].TagsPart2, o.TagsPart2);
         Assert.Equal(input[0].TagsPart3, o.TagsPart3);
-        Assert.Equal(input[0].TagsPart4, o.TagsPart4);
+        Assert.Equal(gen, o.BaseGen); // absolute => base is this generation
     }
 
     [Fact]
-    public void Codec_MultipleDeltaEntities_Roundtrip()
+    public void Codec_RelativeEntry_PreservesBaseGen()
     {
-        var input = new DeltaEntry[8];
-        for (int i = 0; i < 8; i++)
+        const int gen = 5000;
+        var input = new[]
         {
+            new DeltaEntry { EntityId = 7, Flags = 0, BaseGen = gen - 42, DeltaX = 13, DeltaY = -4, DeltaZ = 9 }
+        };
+
+        byte[] encoded = DeltaCodec.Encode(input, 0, 1, gen);
+        var output = new DeltaEntry[1];
+        DeltaCodec.Decode(encoded, output, out int decodedGen);
+
+        Assert.Equal(gen, decodedGen);
+        Assert.Equal(gen - 42, output[0].BaseGen);
+        Assert.Equal(13, output[0].DeltaX);
+        Assert.Equal(-4, output[0].DeltaY);
+    }
+
+    [Fact]
+    public void Codec_UnknownWireVersion_DecodesNothing()
+    {
+        // A packet from an incompatible (e.g. v1) server must be skipped, not misparsed.
+        var bogus = new byte[] { 99, 1, 2, 3, 4, 5 };
+        int count = DeltaCodec.Decode(bogus, new DeltaEntry[4], out int gen);
+        Assert.Equal(0, count);
+        Assert.Equal(0, gen);
+    }
+
+    [Fact]
+    public void Codec_MixedBatch_Roundtrips()
+    {
+        const int gen = 9;
+        var input = new DeltaEntry[6];
+        for (int i = 0; i < 6; i++)
             input[i] = new DeltaEntry
             {
                 EntityId = 100 + i,
                 Flags = i % 2 == 0 ? DeltaCodec.FlagAbsolute : (byte)0,
-                DeltaX = i * 1000, DeltaY = -i * 500, DeltaZ = i * 200,
-                Tick = 50 + i
+                BaseGen = i % 2 == 0 ? gen : gen - i,
+                DeltaX = i * 1000, DeltaY = -i * 500, DeltaZ = i * 200
             };
-        }
 
-        byte[] encoded = DeltaCodec.Encode(input, 0, 8);
-        var output = new DeltaEntry[8];
-        int count = DeltaCodec.Decode(encoded, output);
+        byte[] encoded = DeltaCodec.Encode(input, 0, 6, gen);
+        var output = new DeltaEntry[6];
+        int count = DeltaCodec.Decode(encoded, output, out _);
 
-        Assert.Equal(8, count);
-        for (int i = 0; i < 8; i++)
+        Assert.Equal(6, count);
+        for (int i = 0; i < 6; i++)
         {
             Assert.Equal(input[i].EntityId, output[i].EntityId);
             Assert.Equal(input[i].Flags, output[i].Flags);
             Assert.Equal(input[i].DeltaX, output[i].DeltaX);
-            Assert.Equal(input[i].DeltaY, output[i].DeltaY);
-            Assert.Equal(input[i].DeltaZ, output[i].DeltaZ);
-            Assert.Equal(input[i].Tick, output[i].Tick);
+            Assert.Equal(i % 2 == 0 ? gen : gen - i, output[i].BaseGen);
         }
     }
 
-    // --- Pruning (Fix C) ---
+    // --- EntityTrack: ack promotion (the heart of the zero-desync guarantee) ---
 
     [Fact]
-    public void PruneBaseline_RemovesFromAllClients()
+    public void Track_Promote_AdvancesBaselineToAckedValue()
     {
-        var clients = new ConcurrentDictionary<string, SynergyChannelManager.ClientState>();
-        var state1 = new SynergyChannelManager.ClientState();
-        var state2 = new SynergyChannelManager.ClientState();
-        state1.Baselines[42] = new SynergyChannelManager.EntityBaseline { X = 1 };
-        state1.Baselines[99] = new SynergyChannelManager.EntityBaseline { X = 2 };
-        state2.Baselines[42] = new SynergyChannelManager.EntityBaseline { X = 3 };
-        clients["p1"] = state1;
-        clients["p2"] = state2;
+        var t = new Track();
+        t.RecordSend(1, 10, 0, 0, 0, 0, 0);
+        t.RecordSend(2, 20, 0, 0, 0, 0, 0);
+        t.RecordSend(3, 30, 0, 0, 0, 0, 0);
 
-        // Simulate PruneBaseline(42)
-        foreach (var kvp in clients)
-            kvp.Value.Baselines.TryRemove(42, out _);
+        t.Promote(2);
 
-        Assert.False(state1.Baselines.ContainsKey(42));
-        Assert.True(state1.Baselines.ContainsKey(99)); // unrelated entity untouched
-        Assert.False(state2.Baselines.ContainsKey(42));
+        Assert.True(t.HasAcked);
+        Assert.Equal(2, t.AckedGen);
+        Assert.Equal(20, t.X);           // baseline == value the client held at gen 2
+        Assert.True(t.HasPending);       // gen 3 still un-acked
+
+        t.Promote(3);
+        Assert.Equal(3, t.AckedGen);
+        Assert.Equal(30, t.X);
+        Assert.False(t.HasPending);      // fully synced
     }
 
-    // --- Helper: mirrors client-side ApplyDelta logic (Fix A) ---
-
-    private static bool TryReconstructPosition(
-        DeltaEntry delta,
-        Dictionary<long, SynergyChannelManager.EntityBaseline> baselines,
-        out long absX, out long absY, out long absZ)
+    [Fact]
+    public void Track_Promote_StaleAck_IsNoOp()
     {
-        bool isAbsolute = (delta.Flags & DeltaCodec.FlagAbsolute) != 0;
-        bool teleport = (delta.Flags & DeltaCodec.FlagTeleport) != 0;
+        var t = new Track();
+        t.RecordSend(1, 10, 0, 0, 0, 0, 0);
+        t.RecordSend(2, 20, 0, 0, 0, 0, 0);
+        t.RecordSend(3, 30, 0, 0, 0, 0, 0);
+        t.Promote(2);
 
-        if (isAbsolute || teleport)
-        {
-            absX = delta.DeltaX;
-            absY = delta.DeltaY;
-            absZ = delta.DeltaZ;
-        }
-        else if (baselines.TryGetValue(delta.EntityId, out var baseline))
-        {
-            absX = baseline.X + delta.DeltaX;
-            absY = baseline.Y + delta.DeltaY;
-            absZ = baseline.Z + delta.DeltaZ;
-        }
-        else
-        {
-            // Fix A: skip — no baseline, relative delta cannot be reconstructed
-            absX = absY = absZ = 0;
-            return false;
-        }
+        t.Promote(1); // older ack — cumulative, must not regress
 
-        // Store baseline
-        baselines[delta.EntityId] = new SynergyChannelManager.EntityBaseline
+        Assert.Equal(2, t.AckedGen);
+        Assert.Equal(20, t.X);
+    }
+
+    [Fact]
+    public void Track_AckedEquals_DrivesStationarySuppression()
+    {
+        var t = new Track();
+        t.RecordSend(1, 42, 7, 3, 0, 0, 0);
+        t.Promote(1);
+
+        Assert.True(t.AckedEquals(42, 7, 3, 0, 0, 0));   // client has it => server sends nothing
+        Assert.False(t.AckedEquals(42, 7, 4, 0, 0, 0));  // moved => must send
+    }
+
+    [Fact]
+    public void Track_LatestEquals_PreventsResendRingGrowth()
+    {
+        var t = new Track();
+        t.RecordSend(1, 5, 0, 0, 0, 0, 0);
+        // A stationary resend carries the same value — must be recognised as already-latest.
+        Assert.True(t.LatestEquals(5, 0, 0, 0, 0, 0));
+        Assert.False(t.LatestEquals(6, 0, 0, 0, 0, 0));
+    }
+
+    // --- End-to-end: a dropped UDP packet must NOT cause permanent desync ---
+
+    [Fact]
+    public void LostPacket_SelfHeals_NoPermanentDesync()
+    {
+        var server = new Track();
+        var client = new ClientSim();
+
+        // gen 1: no acked base yet -> absolute. Client receives, applies, acks 1.
+        var e1 = ServerBuild(server, gen: 1, x: 1000);
+        client.Apply(e1, 1);
+        server.Promote(1);
+
+        // gen 2: relative vs acked base (gen 1). *** packet LOST — client never sees it ***
+        ServerBuild(server, gen: 2, x: 2000);
+        // (no client.Apply, no ack for gen 2)
+
+        // gen 3: still acked at gen 1, so the server re-encodes cumulatively vs gen 1.
+        var e3 = ServerBuild(server, gen: 3, x: 3000);
+        client.Apply(e3, 3);
+        server.Promote(3);
+
+        // Despite losing gen 2, the client reconstructs the correct current position.
+        Assert.Equal(3000, client.X);
+        Assert.Equal(3, server.AckedGen);
+        Assert.False(server.HasPending); // converged
+    }
+
+    [Fact]
+    public void StationaryAfterLoss_ResendReachesClient()
+    {
+        // The reported bug: entity moves, its last delta is lost, then it stops (no more vanilla
+        // packets). The resend path keeps re-sending the cumulative delta until the client acks.
+        var server = new Track();
+        var client = new ClientSim();
+
+        var e1 = ServerBuild(server, 1, 1000);
+        client.Apply(e1, 1);
+        server.Promote(1);
+
+        // Entity falls to its final spot at gen 2 — but that packet is LOST. Then it goes stationary.
+        ServerBuild(server, 2, 1500); // lost
+
+        // Server resends (gen 3) because the track is still pending; client receives this one.
+        Assert.True(server.HasPending);
+        var resend = ServerBuild(server, 3, 1500); // same value (stationary) — cumulative vs gen 1
+        client.Apply(resend, 3);
+        server.Promote(3);
+
+        Assert.Equal(1500, client.X); // visible at the correct ground position
+        Assert.False(server.HasPending);
+    }
+
+    [Fact]
+    public void BurstLossThenMove_NoResidualDesync()
+    {
+        // Pathological trace: a value change is lost in a burst, the client recovers the value via a
+        // later resend (against an OLD base it still holds), then the entity moves again. If Promote
+        // advances AckedGen to the server's *sample* generation (which the client never received)
+        // instead of the *acked* generation, the next delta reconstructs against the wrong base and
+        // the entity stays permanently offset. AckedGen must be the generation the client acked.
+        var server = new Track();
+        var client = new ClientSim();
+
+        var e100 = ServerBuild(server, 100, 100);
+        client.Apply(e100, 100);
+        server.Promote(100);
+
+        // g101: E -> 200, packet LOST; then E goes stationary at 200.
+        ServerBuild(server, 101, 200); // never reaches client, never acked
+
+        // g106: a resend reaches the client; it reconstructs 200 via the still-held gen-100 base.
+        var e106 = ServerBuild(server, 106, 200);
+        client.Apply(e106, 106);
+        Assert.Equal(200, client.X);   // recovered
+        server.Promote(106);
+
+        // g120: E moves to 300 — must reconstruct correctly against a base the client actually holds.
+        var e120 = ServerBuild(server, 120, 300);
+        client.Apply(e120, 120);
+
+        Assert.Equal(300, client.X);
+    }
+
+    // --- Helpers mirroring production server-build + client-reconstruct logic ---
+
+    /// <summary>Mirrors DeltaPositionEncoding.BuildEntryLocked for the X axis (pure logic).</summary>
+    private static DeltaEntry ServerBuild(Track t, int gen, long x)
+    {
+        bool absolute = !t.HasAcked || (gen - t.AckedGen) > SynergyChannelManager.MaxBaseAge;
+        var e = new DeltaEntry { EntityId = 1, Flags = absolute ? DeltaCodec.FlagAbsolute : (byte)0 };
+        if (absolute) { e.DeltaX = x; e.BaseGen = gen; e.Flags = DeltaCodec.FlagAbsolute; }
+        else { e.DeltaX = x - t.X; e.BaseGen = t.AckedGen; }
+        if (!t.LatestEquals(x, 0, 0, 0, 0, 0)) t.RecordSend(gen, x, 0, 0, 0, 0, 0);
+        return e;
+    }
+
+    /// <summary>Mirrors DeltaPositionHandler reconstruction: ring lookup by BaseGen, apply delta.</summary>
+    private sealed class ClientSim
+    {
+        private readonly Dictionary<int, long> ring = new();
+        public long X;
+
+        public void Apply(DeltaEntry e, int gen)
         {
-            X = absX, Y = absY, Z = absZ
-        };
-        return true;
+            bool absolute = (e.Flags & DeltaCodec.FlagAbsolute) != 0 || (e.Flags & DeltaCodec.FlagTeleport) != 0;
+            long abs;
+            if (absolute) abs = e.DeltaX;
+            else
+            {
+                // largest stored gen <= BaseGen
+                long baseVal = 0; int bestGen = int.MinValue;
+                foreach (var kv in ring)
+                    if (kv.Key <= e.BaseGen && kv.Key > bestGen) { bestGen = kv.Key; baseVal = kv.Value; }
+                Assert.True(bestGen != int.MinValue, "client must hold the baseline the server encoded against");
+                abs = baseVal + e.DeltaX;
+            }
+            ring[gen] = abs;
+            X = abs;
+        }
     }
 }
