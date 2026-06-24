@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Synergy;
+using Synergy.Client;
 using Synergy.Network;
 using Xunit;
 using Track = Synergy.SynergyChannelManager.EntityTrack;
@@ -253,6 +254,55 @@ public class DeltaEncodingFixTests
         client.Apply(e120, 120);
 
         Assert.Equal(300, client.X);
+    }
+
+    [Fact]
+    public void ClientAck_DoesNotAdvance_WhenAnyEntityDeltaWasNotApplied()
+    {
+        var server = new Track();
+        var client = new ClientSim();
+
+        var e1 = ServerBuild(server, 1, 100);
+        client.Apply(e1, 1);
+        server.Promote(1);
+
+        // gen 2 reaches the client transport, but this entity's delta is not safe to ack
+        // because the client could not apply it (missing entity, missing baseline, or exception).
+        ServerBuild(server, 2, 200);
+
+        int ack = DeltaPositionHandler.ShouldAdvanceAck(decodedCount: 1, ackSafeCount: 0) ? 2 : 1;
+        server.Promote(ack);
+
+        Assert.Equal(1, server.AckedGen);
+        Assert.True(server.HasPending);
+
+        var resend = ServerBuild(server, 3, 200);
+        client.Apply(resend, 3);
+        server.Promote(3);
+
+        Assert.Equal(200, client.X);
+        Assert.False(server.HasPending);
+    }
+
+    [Theory]
+    [InlineData(0, 0, false)]
+    [InlineData(1, 0, false)]
+    [InlineData(2, 1, false)]
+    [InlineData(1, 1, true)]
+    [InlineData(2, 2, true)]
+    public void ClientAck_AdvancesOnlyForFullyAckSafeBatch(int decodedCount, int ackSafeCount, bool expected)
+    {
+        Assert.Equal(expected, DeltaPositionHandler.ShouldAdvanceAck(decodedCount, ackSafeCount));
+    }
+
+    [Theory]
+    [InlineData(-1, 40, 1)]
+    [InlineData(40, 41, 1)]
+    [InlineData(40, 43, 3)]
+    [InlineData(40, 80, 5)]
+    public void ClientInterpolation_UsesVanillaPacketTickDiff(int previousTick, int packetTick, int expected)
+    {
+        Assert.Equal(expected, DeltaPositionHandler.CalculateTickDiff(previousTick, packetTick));
     }
 
     // --- Helpers mirroring production server-build + client-reconstruct logic ---

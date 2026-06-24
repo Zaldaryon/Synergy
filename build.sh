@@ -4,12 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NO_INSTALL=0
 NO_LOG_CLEANUP=0
+RUN_TESTS=0
 
 for arg in "$@"; do
     case "${arg,,}" in
         -noinstall)    NO_INSTALL=1 ;;
         -nologcleanup) NO_LOG_CLEANUP=1 ;;
         -nodeploy)     NO_INSTALL=1; NO_LOG_CLEANUP=1 ;;
+        -test)         RUN_TESTS=1 ;;
         *) ;;
     esac
 done
@@ -83,6 +85,11 @@ rm -rf bin
 
 dotnet build Synergy.csproj -c Release -v quiet /p:RestoreSources= /p:RestoreIgnoreFailedSources=true 2>&1 \
     | grep -iE 'warning|error' || true
+
+if [[ "$RUN_TESTS" == "1" ]]; then
+    echo "Running tests..."
+    dotnet test Tests/Tests.csproj -c Release -v quiet /p:RestoreSources= /p:RestoreIgnoreFailedSources=true
+fi
 
 MOD_VERSION="$(grep -oP '"version"\s*:\s*"\K[^"]+' modinfo.json)"
 TFM="$(grep -oP '<TargetFramework>\K[^<]+' Synergy.csproj)"

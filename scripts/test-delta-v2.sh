@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-VS_DIR="${VINTAGE_STORY:-/home/vitorpn/Misc/vintagestory}"
+VS_DIR="${VINTAGE_STORY:-/.local/share/vintagestory}"
 # Separate data paths — server uses default, client uses same default (needs account/settings)
 SERVER_DATA="$HOME/.config/VintagestoryData"
 CLIENT_DATA="$HOME/.config/VintagestoryData"
@@ -333,7 +333,7 @@ info "Post-flight log analysis..."
 ERRORS=0
 
 echo "  Server log:"
-AD_COUNT=$(grep -c "Auto-disabled" "$SERVER_LOG" 2>/dev/null || echo "0")
+AD_COUNT=$(grep -c "Auto-disabled" "" 2>/dev/null | tail -1 || echo "0")
 if [[ "$AD_COUNT" -gt 0 ]]; then
     echo -e "    ${RED}✗ Auto-disabled found ($AD_COUNT occurrences)${NC}"
     grep "Auto-disabled" "$SERVER_LOG" | tail -5
@@ -342,7 +342,7 @@ else
     echo -e "    ${GREEN}✓ No Auto-disabled events${NC}"
 fi
 
-ERR_COUNT=$(grep -cE "DeltaEncoding.*[Ee]rror|DeltaEncoding.*[Ee]xception" "$SERVER_LOG" 2>/dev/null || echo "0")
+ERR_COUNT=$(grep -cE "DeltaEncoding.*[Ee]rror|DeltaEncoding.*[Ee]xception" "" 2>/dev/null | tail -1 || echo "0")
 if [[ "$ERR_COUNT" -gt 0 ]]; then
     echo -e "    ${RED}✗ DeltaEncoding errors found ($ERR_COUNT)${NC}"
     grep -E "DeltaEncoding.*[Ee]rror|DeltaEncoding.*[Ee]xception" "$SERVER_LOG" | tail -5
@@ -352,7 +352,7 @@ else
 fi
 
 echo "  Client log:"
-CLI_AD=$(grep -c "Auto-disabled" "$CLIENT_LOG" 2>/dev/null || echo "0")
+CLI_AD=$(grep -c "Auto-disabled" "" 2>/dev/null | tail -1 || echo "0")
 if [[ "$CLI_AD" -gt 0 ]]; then
     echo -e "    ${RED}✗ Auto-disabled found ($CLI_AD)${NC}"
     ERRORS=$((ERRORS + 1))
@@ -360,7 +360,7 @@ else
     echo -e "    ${GREEN}✓ No Auto-disabled events${NC}"
 fi
 
-CLI_ERR=$(grep -cE "Delta decode error|DeltaPosition.*[Ee]rror" "$CLIENT_LOG" 2>/dev/null || echo "0")
+CLI_ERR=$(grep -cE "Delta decode error|DeltaPosition.*[Ee]rror" "" 2>/dev/null | tail -1 || echo "0")
 if [[ "$CLI_ERR" -gt 0 ]]; then
     echo -e "    ${RED}✗ Delta decode errors ($CLI_ERR)${NC}"
     grep -E "Delta decode error|DeltaPosition.*[Ee]rror" "$CLIENT_LOG" | tail -5
