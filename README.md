@@ -8,7 +8,7 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
 - Dependency declared in `modinfo.json`: `game: 1.22.0` (minimum-version semantics)
 - Target framework: `net10.0` (Vintage Story 1.22 ships with .NET 10)
 - Validated operational window: `1.22.0+`
-- Current version: `1.1.22`
+- Current version: `1.1.24`
 
 ## Goals
 - Reduce server TPS overhead from entity ticking, collision, and network I/O.
@@ -160,9 +160,9 @@ Coordinated server-side performance and fluidity optimizations for Vintage Story
    - Server-client handshake via mod TCP channel identifies delta-capable clients
    - For Synergy clients: sends baseline-relative delta-encoded positions via mod channel
    - For vanilla clients: exact vanilla behavior (absolute positions via UDP)
-   - Delta = `currentPos - lastBaselinePos` (integer arithmetic on quantized longs, zero precision loss)
-   - Baseline resets every 30 ticks (~1s) matching vanilla's `forceUpdate` cadence
-   - Packet loss behavior identical to vanilla: entity freezes until next packet, no wrong-position state
+   - Delta = `currentPos - lastAckedBaselinePos` (integer arithmetic on quantized longs, zero precision loss)
+   - Exact per-datagram ACKs; stale or missing baselines fall back to absolute position packets
+   - Packet loss behavior matches vanilla: entity freezes until the next valid packet, no wrong-position state
    - Animations and tags always sent through vanilla TCP channel (unchanged for all clients)
    - ZigZag + varint encoding: walking entity delta ≈ 5 bytes vs 11 bytes absolute position
    - **Impact:** ~50-60% bandwidth reduction on entity position packets for Synergy clients.

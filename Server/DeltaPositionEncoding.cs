@@ -20,7 +20,7 @@ namespace Synergy.Server
     /// absolute packets through the normal UDP path.
     ///
     /// Fixes applied vs initial implementation:
-    /// - Sub-batching: groups of 8 entities per UDP packet (matches vanilla, stays under 508 bytes)
+    /// - Sub-batching: groups of 3 entities per UDP packet (absolute-safe, stays under 508 bytes)
     /// - TOCTOU: uses TryGetValue on ConcurrentDictionary for tag packets
     /// - Null player: still sends vanilla UDP positions when Player is null (matches vanilla)
     /// - ThreadStatic lists: reused across calls, not allocated per call
@@ -35,7 +35,6 @@ namespace Synergy.Server
         internal static int errorCount;
         internal static bool disabled;
 
-        private const int MaxEntitiesPerBatch = 8;
         private const int MaxEntitiesPerBatchAbsolute = 3; // Absolute packets are larger; 3 × ~107 = ~321 bytes (safe under 508)
 
         // PhysicsManager instance field accessors
@@ -233,14 +232,13 @@ namespace Synergy.Server
                 var reusableBatch = t_batch ??= new DeltaPositionBatch();
                 int deltaCount;
 
-                int generation = channelManager.BaselineGeneration;
-
                 foreach (var clientObj in clientList)
                 {
                     vanillaPosList.Clear();
                     animList.Clear();
                     tagList.Clear();
                     deltaCount = 0;
+                    int buildGeneration = channelManager.BaselineGeneration;
 
                     // Determine if this is a delta client
                     var player = ccPlayerRef(clientObj);
@@ -262,7 +260,7 @@ namespace Synergy.Server
                         foreach (var entity in entityList)
                         {
                             CollectPackets(entity.EntityId, posPackets, animPackets, tagPacketsObj,
-                                isDeltaClient, clientState, generation,
+                                isDeltaClient, clientState, buildGeneration,
                                 vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount,
                                 entity is EntityItem);
                         }
@@ -285,28 +283,26 @@ namespace Synergy.Server
                             // Check if entity is EntityItem — excluded from delta encoding entirely
                             var ent = sapi.World.GetEntityById(eid);
                             CollectPackets(eid, posPackets, animPackets, tagPacketsObj,
-                                isDeltaClient, clientState, generation,
+                                isDeltaClient, clientState, buildGeneration,
                                 vanillaPosList, animList, tagList, deltaBuffer, ref deltaCount,
                                 isEntityItem: ent is EntityItem);
                         }
                     }
 
-                    // Send delta batches (sub-batched to stay under UDP MTU)
+                    // Send delta batches (sub-batched to stay under UDP MTU). Use the absolute-safe
+                    // limit because entries can be converted to absolute against the actual datagram
+                    // generation immediately before encoding.
                     if (isDeltaClient && deltaCount > 0)
                     {
-                        // Count absolute entries to determine batch size
-                        int absCount = 0;
-                        for (int i = 0; i < deltaCount; i++)
-                        {
-                            if ((deltaBuffer[i].Flags & DeltaCodec.FlagAbsolute) != 0) absCount++;
-                        }
-                        int batchLimit = absCount * 2 > deltaCount
-                            ? MaxEntitiesPerBatchAbsolute : MaxEntitiesPerBatch;
+                        const int batchLimit = MaxEntitiesPerBatchAbsolute;
 
                         for (int i = 0; i < deltaCount; i += batchLimit)
                         {
                             int batchSize = Math.Min(batchLimit, deltaCount - i);
-                            reusableBatch.Data = DeltaCodec.Encode(deltaBuffer, i, batchSize, generation);
+                            int sendGeneration = channelManager.NextGeneration();
+                            PrepareEntriesForGeneration(deltaBuffer, i, batchSize, sendGeneration);
+                            RecordSentEntries(clientState, deltaBuffer, i, batchSize, sendGeneration);
+                            reusableBatch.Data = DeltaCodec.Encode(deltaBuffer, i, batchSize, sendGeneration);
                             channelManager.SendDeltaBatch(reusableBatch, player);
                             DiagDeltaEncoding.OnDeltaBatch(reusableBatch.Data.Length);
                             DiagDeltaEncoding.OnVanillaEquivBytes(batchSize * 107);
@@ -383,7 +379,7 @@ namespace Synergy.Server
                      && clientState.Tracks.TryGetValue(entityId, out var track) && track.HasPending)
             {
                 // Entity left vanilla's per-tick set (went stationary) but the client hasn't acked its
-                // last position yet. Resend the cumulative delta against the acked base until it does,
+                // last position yet. Resend the current delta against the acked base until it does,
                 // so a single dropped UDP packet can't leave it frozen (the reported dropped-item bug).
                 if (TryBuildResend(track, generation, entityId, out var entry))
                     deltaBuffer[deltaCount++] = entry;
@@ -436,8 +432,8 @@ namespace Synergy.Server
         }
 
         /// <summary>
-        /// Build one delta entry against the client's ACKED baseline (Quake 3 / Source model) and
-        /// record the send. Caller must hold <c>lock(track)</c>. Returns false (no entry) when the
+        /// Build one delta entry against the client's ACKED baseline (Quake 3 / Source model).
+        /// Caller must hold <c>lock(track)</c>. Returns false (no entry) when the
         /// entity's value already equals the acked baseline — the client provably has it, so nothing
         /// is sent (ack-aware stationary suppression).
         ///
@@ -466,6 +462,8 @@ namespace Synergy.Server
                 Yaw = yaw, Pitch = pitch, Roll = roll, HeadYaw = headYaw, HeadPitch = headPitch, BodyYaw = bodyYaw,
                 Controls = controls, Tick = tick, PositionVersion = posVer, MountControls = mountControls,
                 TagsPart1 = t1, TagsPart2 = t2, TagsPart3 = t3, TagsPart4 = t4,
+                AbsoluteX = x, AbsoluteY = y, AbsoluteZ = z,
+                AbsoluteMotionX = mx, AbsoluteMotionY = my, AbsoluteMotionZ = mz,
                 Flags = teleport ? DeltaCodec.FlagTeleport : (byte)0
             };
 
@@ -483,12 +481,50 @@ namespace Synergy.Server
                 entry.BaseGen = track.AckedGen;
             }
 
-            // Record this send so an ack can promote the exact value the client held. Skip when the
-            // value is unchanged from the newest pending send (a stationary resend) — no ring growth.
-            if (!track.LatestEquals(x, y, z, mx, my, mz))
-                track.RecordSend(generation, x, y, z, mx, my, mz);
             track.SetLastFields(yaw, pitch, roll, headYaw, headPitch, bodyYaw, controls, tick, posVer, mountControls, t1, t2, t3, t4);
             return true;
+        }
+
+        private static void PrepareEntriesForGeneration(DeltaEntry[] entries, int offset, int count, int generation)
+        {
+            int end = offset + count;
+            for (int i = offset; i < end; i++)
+            {
+                ref var entry = ref entries[i];
+                if ((entry.Flags & (DeltaCodec.FlagAbsolute | DeltaCodec.FlagTeleport)) != 0)
+                    continue;
+
+                if (generation - entry.BaseGen <= SynergyChannelManager.MaxBaseAge)
+                    continue;
+
+                entry.DeltaX = entry.AbsoluteX;
+                entry.DeltaY = entry.AbsoluteY;
+                entry.DeltaZ = entry.AbsoluteZ;
+                entry.DeltaMotionX = entry.AbsoluteMotionX;
+                entry.DeltaMotionY = entry.AbsoluteMotionY;
+                entry.DeltaMotionZ = entry.AbsoluteMotionZ;
+                entry.BaseGen = generation;
+                entry.Flags |= DeltaCodec.FlagAbsolute;
+            }
+        }
+
+        private static void RecordSentEntries(SynergyChannelManager.ClientState clientState, DeltaEntry[] entries, int offset, int count, int generation)
+        {
+            if (clientState == null) return;
+
+            int end = offset + count;
+            for (int i = offset; i < end; i++)
+            {
+                ref var entry = ref entries[i];
+                if (!clientState.Tracks.TryGetValue(entry.EntityId, out var track)) continue;
+
+                lock (track)
+                {
+                    track.RecordSend(generation,
+                        entry.AbsoluteX, entry.AbsoluteY, entry.AbsoluteZ,
+                        entry.AbsoluteMotionX, entry.AbsoluteMotionY, entry.AbsoluteMotionZ);
+                }
+            }
         }
 
         private static void SendVanillaPositions(object udpNetwork, object client, List<object> posList)

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Synergy;
+using Synergy.Client;
 using Synergy.Network;
 using Xunit;
 using Track = Synergy.SynergyChannelManager.EntityTrack;
@@ -144,10 +145,25 @@ public class DeltaEncodingFixTests
         t.RecordSend(3, 30, 0, 0, 0, 0, 0);
         t.Promote(2);
 
-        t.Promote(1); // older ack — cumulative, must not regress
+        t.Promote(1); // older exact ack — must not regress
 
         Assert.Equal(2, t.AckedGen);
         Assert.Equal(20, t.X);
+    }
+
+    [Fact]
+    public void Track_Promote_DoesNotAdvanceForGenerationNotRecordedOnThisTrack()
+    {
+        // Regression for multi-datagram generations: another UDP datagram with generation 11 was
+        // received and acked, but this entity's generation-10 datagram was lost. Promoting this
+        // track on ack 11 would tell the server the client has a value it never received.
+        var t = new Track();
+        t.RecordSend(10, 100, 0, 0, 0, 0, 0);
+
+        t.Promote(11);
+
+        Assert.False(t.HasAcked);
+        Assert.True(t.HasPending);
     }
 
     [Fact]
@@ -162,11 +178,12 @@ public class DeltaEncodingFixTests
     }
 
     [Fact]
-    public void Track_LatestEquals_PreventsResendRingGrowth()
+    public void Track_LatestEquals_DetectsNewestPendingValue()
     {
         var t = new Track();
         t.RecordSend(1, 5, 0, 0, 0, 0, 0);
-        // A stationary resend carries the same value — must be recognised as already-latest.
+        // A stationary resend carries the same value — the send path can detect it when deciding
+        // whether a packet is redundant, while ACK tracking still records sent datagram generations.
         Assert.True(t.LatestEquals(5, 0, 0, 0, 0, 0));
         Assert.False(t.LatestEquals(6, 0, 0, 0, 0, 0));
     }
@@ -188,7 +205,7 @@ public class DeltaEncodingFixTests
         ServerBuild(server, gen: 2, x: 2000);
         // (no client.Apply, no ack for gen 2)
 
-        // gen 3: still acked at gen 1, so the server re-encodes cumulatively vs gen 1.
+        // gen 3: still acked at gen 1, so the server re-encodes the current value vs gen 1.
         var e3 = ServerBuild(server, gen: 3, x: 3000);
         client.Apply(e3, 3);
         server.Promote(3);
@@ -203,7 +220,7 @@ public class DeltaEncodingFixTests
     public void StationaryAfterLoss_ResendReachesClient()
     {
         // The reported bug: entity moves, its last delta is lost, then it stops (no more vanilla
-        // packets). The resend path keeps re-sending the cumulative delta until the client acks.
+        // packets). The resend path keeps re-sending the current delta until the client acks.
         var server = new Track();
         var client = new ClientSim();
 
@@ -216,7 +233,7 @@ public class DeltaEncodingFixTests
 
         // Server resends (gen 3) because the track is still pending; client receives this one.
         Assert.True(server.HasPending);
-        var resend = ServerBuild(server, 3, 1500); // same value (stationary) — cumulative vs gen 1
+        var resend = ServerBuild(server, 3, 1500); // same value (stationary) — still encoded vs gen 1
         client.Apply(resend, 3);
         server.Promote(3);
 
@@ -255,6 +272,55 @@ public class DeltaEncodingFixTests
         Assert.Equal(300, client.X);
     }
 
+    [Fact]
+    public void ClientAck_DoesNotAdvance_WhenAnyEntityDeltaWasNotApplied()
+    {
+        var server = new Track();
+        var client = new ClientSim();
+
+        var e1 = ServerBuild(server, 1, 100);
+        client.Apply(e1, 1);
+        server.Promote(1);
+
+        // gen 2 reaches the client transport, but this entity's delta is not safe to ack
+        // because the client could not apply it (missing entity, missing baseline, or exception).
+        ServerBuild(server, 2, 200);
+
+        int ack = DeltaPositionHandler.ShouldAdvanceAck(decodedCount: 1, ackSafeCount: 0) ? 2 : 1;
+        server.Promote(ack);
+
+        Assert.Equal(1, server.AckedGen);
+        Assert.True(server.HasPending);
+
+        var resend = ServerBuild(server, 3, 200);
+        client.Apply(resend, 3);
+        server.Promote(3);
+
+        Assert.Equal(200, client.X);
+        Assert.False(server.HasPending);
+    }
+
+    [Theory]
+    [InlineData(0, 0, false)]
+    [InlineData(1, 0, false)]
+    [InlineData(2, 1, false)]
+    [InlineData(1, 1, true)]
+    [InlineData(2, 2, true)]
+    public void ClientAck_AdvancesOnlyForFullyAckSafeBatch(int decodedCount, int ackSafeCount, bool expected)
+    {
+        Assert.Equal(expected, DeltaPositionHandler.ShouldAdvanceAck(decodedCount, ackSafeCount));
+    }
+
+    [Theory]
+    [InlineData(-1, 40, 1)]
+    [InlineData(40, 41, 1)]
+    [InlineData(40, 43, 3)]
+    [InlineData(40, 80, 5)]
+    public void ClientInterpolation_UsesVanillaPacketTickDiff(int previousTick, int packetTick, int expected)
+    {
+        Assert.Equal(expected, DeltaPositionHandler.CalculateTickDiff(previousTick, packetTick));
+    }
+
     // --- Helpers mirroring production server-build + client-reconstruct logic ---
 
     /// <summary>Mirrors DeltaPositionEncoding.BuildEntryLocked for the X axis (pure logic).</summary>
@@ -264,7 +330,7 @@ public class DeltaEncodingFixTests
         var e = new DeltaEntry { EntityId = 1, Flags = absolute ? DeltaCodec.FlagAbsolute : (byte)0 };
         if (absolute) { e.DeltaX = x; e.BaseGen = gen; e.Flags = DeltaCodec.FlagAbsolute; }
         else { e.DeltaX = x - t.X; e.BaseGen = t.AckedGen; }
-        if (!t.LatestEquals(x, 0, 0, 0, 0, 0)) t.RecordSend(gen, x, 0, 0, 0, 0, 0);
+        t.RecordSend(gen, x, 0, 0, 0, 0, 0);
         return e;
     }
 

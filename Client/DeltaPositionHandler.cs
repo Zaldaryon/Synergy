@@ -12,12 +12,12 @@ namespace Synergy.Client
     /// <summary>
     /// Client side of the ack-based delta protocol (Quake 3 / Source model).
     ///
-    /// Each batch is tagged with a snapshot generation. A relative entry carries the generation of
+    /// Each datagram is tagged with a generation. A relative entry carries the generation of
     /// the baseline it was encoded against (BaseGen); the client reconstructs the absolute position
     /// from the value it held at that generation. The client keeps a small per-entity ring of recent
-    /// values for that lookup, and periodically acks the highest generation it has received. Because
-    /// the server only ever encodes against an acked baseline and resends until acked, a lost UDP
-    /// packet costs at most a frame — there is no permanent desync.
+    /// values for that lookup, and periodically acks the exact datagram generations it received.
+    /// Because the server only ever encodes against an acked baseline and resends until acked, a
+    /// lost UDP packet costs at most a frame — there is no permanent desync.
     ///
     /// When connected to a vanilla / non-Synergy server this handler is never invoked.
     /// </summary>
@@ -33,6 +33,7 @@ namespace Synergy.Client
             private SynergyChannelManager.PosSample[] ring;
             private int head, count;
             public int LastGen = -1;
+            public int LastTick = -1;
 
             public void Push(int gen, long x, long y, long z, long mx, long my, long mz)
             {
@@ -60,8 +61,8 @@ namespace Synergy.Client
         }
 
         private readonly Dictionary<long, ClientTrack> tracks = new();
-        private int highestDecodedGen = -1;
-        private int lastAckedGen = -1;
+        private readonly List<int> pendingAckGenerations = new();
+        private readonly HashSet<int> pendingAckSet = new();
         private int ackTickCounter;
         private long ackListenerId;
 
@@ -83,8 +84,8 @@ namespace Synergy.Client
 
             capi.Event.OnEntityDespawn += OnEntityDespawn;
 
-            // Send a cumulative ack every AckIntervalTicks ticks (~100ms) so the server can advance
-            // each entity's delta baseline to state we provably have.
+            // Send exact datagram acks every AckIntervalTicks ticks (~100ms) so the server can
+            // advance only entity baselines that were actually included in received datagrams.
             ackListenerId = capi.Event.RegisterGameTickListener(_ => SendAckIfNeeded(), 33);
 
             capi.Logger.Notification("[Synergy] Client delta handler initialized");
@@ -93,6 +94,8 @@ namespace Synergy.Client
         public void Dispose()
         {
             tracks.Clear();
+            pendingAckGenerations.Clear();
+            pendingAckSet.Clear();
             serverHasSynergy = false;
             if (capi != null)
             {
@@ -126,11 +129,17 @@ namespace Synergy.Client
         {
             if (++ackTickCounter < SynergyChannelManager.AckIntervalTicks) return;
             ackTickCounter = 0;
-            if (highestDecodedGen == lastAckedGen || !serverHasSynergy) return;
+            if (pendingAckGenerations.Count == 0 || !serverHasSynergy) return;
             if (handshakeChannel == null || !handshakeChannel.Connected) return;
 
-            lastAckedGen = highestDecodedGen;
-            handshakeChannel.SendPacket(new SynergyAck { Generation = highestDecodedGen });
+            int[] generations = pendingAckGenerations.ToArray();
+            handshakeChannel.SendPacket(new SynergyAck
+            {
+                Generation = generations[generations.Length - 1],
+                Generations = generations
+            });
+            pendingAckGenerations.Clear();
+            pendingAckSet.Clear();
         }
 
         // Reusable decode buffer (main thread only, no concurrency)
@@ -144,10 +153,16 @@ namespace Synergy.Client
             {
                 int count = DeltaCodec.Decode(batch.Data, decodeBuffer, out int generation);
                 if (count == 0) return;
-                if (generation > highestDecodedGen) highestDecodedGen = generation;
 
+                int ackSafeCount = 0;
                 for (int i = 0; i < count; i++)
-                    ApplyDelta(ref decodeBuffer[i], generation);
+                {
+                    if (ApplyDelta(ref decodeBuffer[i], generation))
+                        ackSafeCount++;
+                }
+
+                if (ShouldAdvanceAck(count, ackSafeCount))
+                    QueueAck(generation);
             }
             catch (Exception ex)
             {
@@ -155,16 +170,28 @@ namespace Synergy.Client
             }
         }
 
-        private void ApplyDelta(ref DeltaEntry delta, int generation)
+        public static bool ShouldAdvanceAck(int decodedCount, int ackSafeCount)
+            => decodedCount > 0 && ackSafeCount == decodedCount;
+
+        private void QueueAck(int generation)
+        {
+            if (pendingAckSet.Add(generation))
+                pendingAckGenerations.Add(generation);
+        }
+
+        public static int CalculateTickDiff(int previousTick, int packetTick)
+            => previousTick < 0 ? 1 : Math.Min(packetTick - previousTick, 5);
+
+        private bool ApplyDelta(ref DeltaEntry delta, int generation)
         {
             Entity entity = capi.World.GetEntityById(delta.EntityId);
-            if (entity == null) return;
+            if (entity == null) return false;
 
             if (!tracks.TryGetValue(delta.EntityId, out var track))
                 tracks[delta.EntityId] = track = new ClientTrack();
 
             // Stale/reordered snapshot for this entity — we already have a newer one.
-            if (generation <= track.LastGen) return;
+            if (generation <= track.LastGen) return true;
 
             bool isAbsolute = (delta.Flags & DeltaCodec.FlagAbsolute) != 0;
             bool teleport = (delta.Flags & DeltaCodec.FlagTeleport) != 0;
@@ -185,17 +212,24 @@ namespace Synergy.Client
                 // No stored baseline for this BaseGen — should not happen (the server only encodes
                 // against a generation we acked, which is within the ring). Defensive: skip and wait
                 // for the server's age-based absolute resync (within MaxBaseAge generations).
-                return;
+                return false;
             }
 
-            int prevGen = track.LastGen;
+            int prevTick = track.LastTick;
+            if (prevTick >= 0 && delta.Tick <= prevTick)
+            {
+                track.LastGen = generation;
+                return true;
+            }
+
             track.Push(generation, absX, absY, absZ, absMX, absMY, absMZ);
             track.LastGen = generation;
+            track.LastTick = delta.Tick;
 
-            // Interpolation pacing from the snapshot cadence (replaces vanilla's per-entity tick).
-            int tickDiff = prevGen < 0 ? 1 : Math.Min(generation - prevGen, 5);
+            // Match vanilla interpolation pacing: tickDiff is based on the per-entity packet tick.
+            int tickDiff = CalculateTickDiff(prevTick, delta.Tick);
             entity.Attributes.SetInt("tickDiff", tickDiff);
-            entity.Attributes.SetInt("tick", generation);
+            entity.Attributes.SetInt("tick", delta.Tick);
 
             // Position — inline deserialization: (double)v / 16384.0 and (float)v / 1024f
             var pos = entity.Pos;
@@ -227,6 +261,8 @@ namespace Synergy.Client
             entity.Tags = new TagSetFast(Vector256.Create(
                 (ulong)delta.TagsPart1, (ulong)delta.TagsPart2,
                 (ulong)delta.TagsPart3, (ulong)delta.TagsPart4));
+
+            return true;
         }
 
         public bool ServerHasSynergy => serverHasSynergy;

@@ -11,15 +11,15 @@ namespace Synergy
     /// Manages the Synergy network channel: handshake, client capabilities, and the per-client
     /// ack-based delta state.
     ///
-    /// Model (Quake 3 / Source / Gaffer): the server delta-encodes each entity against the value
-    /// the client last ACKnowledged. A lost UDP packet is never acked, so the server keeps resending
-    /// the cumulative change against the older acked base until an ack advances it — no permanent
-    /// desync is possible. Each entity keeps a small ring of its un-acked sent values so an incoming
-    /// ack can promote the exact value the client held at the acked generation.
+    /// Model (Quake 3 / Source / Gaffer): the server delta-encodes each entity against the value the
+    /// client last ACKnowledged. A lost UDP datagram is never acked, so the server keeps resending the
+    /// current change against the older acked base until a later datagram carrying that entity is
+    /// acked. Each entity keeps a small ring of sent values by datagram generation, and an ack only
+    /// promotes tracks that were actually present in that exact datagram.
     /// </summary>
     public class SynergyChannelManager
     {
-        /// <summary>Snapshot generation counter, ++ every ~33ms tick. Tags each batch; the unit acks reference.</summary>
+        /// <summary>Client sends exact datagram acks every N ticks (~100ms).</summary>
         public const int AckIntervalTicks = 3; // client sends an ack every N ticks (~100ms)
 
         /// <summary>Max un-acked sends kept per entity. Bounds delta age (and so delta magnitude) and memory.</summary>
@@ -63,7 +63,7 @@ namespace Synergy
             public bool AckedEquals(long x, long y, long z, long mx, long my, long mz)
                 => HasAcked && X == x && Y == y && Z == z && MotionX == mx && MotionY == my && MotionZ == mz;
 
-            // Ring of distinct un-acked sent values, oldest..newest, strictly increasing Gen.
+            // Ring of un-acked sent datagrams for this entity, oldest..newest, strictly increasing Gen.
             private PosSample[] ring;
             private int head;   // index of oldest
             private int count;
@@ -88,7 +88,7 @@ namespace Synergy
                 return new PosSample { Gen = AckedGen, X = X, Y = Y, Z = Z, MotionX = MotionX, MotionY = MotionY, MotionZ = MotionZ };
             }
 
-            /// <summary>Record a distinct new value sent at <paramref name="gen"/>. Drops the oldest if full.</summary>
+            /// <summary>Record a value sent in datagram <paramref name="gen"/>. Drops the oldest if full.</summary>
             public void RecordSend(int gen, long x, long y, long z, long mx, long my, long mz)
             {
                 ring ??= new PosSample[RingCapacity];
@@ -101,29 +101,34 @@ namespace Synergy
             }
 
             /// <summary>
-            /// Advance the acked baseline to the newest sent value with Gen ≤ ackGen, and drop all
-            /// samples up to it. Idempotent and monotonic — older/duplicate acks are no-ops.
+            /// Advance the acked baseline only if this entity was included in the exact acked
+            /// datagram. This prevents one received sibling datagram from acknowledging another
+            /// datagram that was lost.
             /// </summary>
             public void Promote(int ackGen)
             {
-                bool promoted = false;
+                int promoteOffset = -1;
                 PosSample promo = default;
-                while (count > 0 && ring[head].Gen <= ackGen)
+
+                for (int i = 0; i < count; i++)
                 {
-                    promo = ring[head];
-                    head = (head + 1) % RingCapacity;
-                    count--;
-                    promoted = true;
+                    ref var sample = ref ring[(head + i) % RingCapacity];
+                    if (sample.Gen == ackGen)
+                    {
+                        promoteOffset = i;
+                        promo = sample;
+                        break;
+                    }
                 }
-                if (promoted && (!HasAcked || promo.Gen > AckedGen))
+
+                if (promoteOffset < 0) return;
+
+                int removeCount = promoteOffset + 1;
+                head = (head + removeCount) % RingCapacity;
+                count -= removeCount;
+
+                if (!HasAcked || ackGen > AckedGen)
                 {
-                    // Baseline VALUE comes from the newest sent sample ≤ ackGen, but AckedGen is set to
-                    // ackGen — the generation the client actually received & acked — NOT promo.Gen.
-                    // The client keys its reconstruction ring by received generation; the server's
-                    // sample generation may be one the client never got (it recovered the value via a
-                    // later resend against an older base). Encoding the next delta against promo.Gen
-                    // would point the client at a baseline it doesn't hold → permanent offset. ackGen
-                    // is, by definition, a generation the client received and reconstructed.
                     X = promo.X; Y = promo.Y; Z = promo.Z;
                     MotionX = promo.MotionX; MotionY = promo.MotionY; MotionZ = promo.MotionZ;
                     AckedGen = ackGen;
@@ -136,7 +141,6 @@ namespace Synergy
         {
             public int Capabilities;
             public readonly ConcurrentDictionary<long, EntityTrack> Tracks = new();
-            public int LastAckGen = -1; // guarded by Volatile; drops stale/out-of-order acks
         }
 
         private readonly ICoreServerAPI sapi;
@@ -146,6 +150,8 @@ namespace Synergy
 
         private int baselineGeneration;
         public int BaselineGeneration => Volatile.Read(ref baselineGeneration);
+
+        public int NextGeneration() => Interlocked.Increment(ref baselineGeneration);
 
         private readonly ConcurrentDictionary<string, ClientState> clients = new();
 
@@ -222,15 +228,24 @@ namespace Synergy
         {
             if (!clients.TryGetValue(player.PlayerUID, out var state)) return;
 
-            // Drop stale/out-of-order acks (cumulative — only the highest matters).
-            int prev = Volatile.Read(ref state.LastAckGen);
-            if (ack.Generation <= prev) return;
-            Volatile.Write(ref state.LastAckGen, ack.Generation);
+            if (ack.Generations != null && ack.Generations.Length > 0)
+            {
+                foreach (int generation in ack.Generations)
+                    PromoteReceivedGeneration(state, generation);
+                return;
+            }
+
+            PromoteReceivedGeneration(state, ack.Generation);
+        }
+
+        private static void PromoteReceivedGeneration(ClientState state, int generation)
+        {
+            if (generation < 0) return;
 
             foreach (var kvp in state.Tracks)
             {
                 var track = kvp.Value;
-                lock (track) track.Promote(ack.Generation);
+                lock (track) track.Promote(generation);
             }
         }
 

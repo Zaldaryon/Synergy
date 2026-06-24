@@ -24,17 +24,18 @@ namespace Synergy.Network
     }
 
     /// <summary>
-    /// Client → server cumulative acknowledgement: the highest snapshot generation the client has
-    /// received and decoded. Sent over the reliable handshake channel. The server advances each
-    /// entity's delta baseline to the value the client held at this generation, so every delta is
-    /// encoded against state the client provably has. A lost UDP packet is simply never acked, so
-    /// the server keeps resending the cumulative change against the older acked base until an ack
-    /// advances it — there is no permanent desync. (Quake 3 / Source / Gaffer state-sync model.)
+    /// Client → server acknowledgement for exact UDP datagram generations the client received and
+    /// decoded. Sent over the reliable handshake channel. The server only advances entity tracks
+    /// that were recorded in an acked datagram, so one received datagram can never acknowledge a
+    /// sibling datagram that was lost. A lost UDP packet is simply never acked, so the server keeps
+    /// resending the current change against the older acked base until a later datagram carrying
+    /// that entity is acked.
     /// </summary>
     [ProtoContract]
     public class SynergyAck
     {
-        [ProtoMember(1)] public int Generation;
+        [ProtoMember(1)] public int Generation;      // Legacy/single ack path.
+        [ProtoMember(2)] public int[] Generations;   // Batched exact datagram acks.
     }
 
     /// <summary>
@@ -51,15 +52,17 @@ namespace Synergy.Network
         public long TagsPart1, TagsPart2, TagsPart3, TagsPart4;
         public int BaseGen; // generation of the baseline this delta is encoded against (== batch gen when absolute)
         public byte Flags;  // bit 0 = IsAbsolute, bit 1 = Teleport
+        public long AbsoluteX, AbsoluteY, AbsoluteZ; // Server-side send sample; not serialized.
+        public long AbsoluteMotionX, AbsoluteMotionY, AbsoluteMotionZ;
     }
 
     /// <summary>
     /// Compact binary encoder/decoder for entity position deltas.
     /// Format: fixed field order, no tags, varint/zigzag encoding.
     ///
-    /// Wire format (v2): a batch is one tick's snapshot for one client.
+    /// Wire format (v2): a batch is one UDP datagram for one client.
     ///   byte     wireVersion (== WireVersion)
-    ///   varint   generation        (snapshot id for this batch)
+    ///   varint   generation        (datagram id for this batch)
     ///   varint   count
     ///   per entity:
     ///     varint   entityId
@@ -83,7 +86,7 @@ namespace Synergy.Network
 
         /// <summary>
         /// Encode entities[offset..offset+count] into a compact byte array tagged with this batch's
-        /// snapshot generation. The returned byte[] is a fresh allocation (required by SendPacket).
+        /// datagram generation. The returned byte[] is a fresh allocation (required by SendPacket).
         /// </summary>
         public static byte[] Encode(DeltaEntry[] entries, int offset, int count, int generation)
         {
@@ -138,7 +141,7 @@ namespace Synergy.Network
 
         /// <summary>
         /// Decode a batch back into DeltaEntry structs. Returns the number of entries decoded and
-        /// the batch's snapshot generation. Returns 0 (and generation 0) for an unrecognised wire
+        /// the batch's datagram generation. Returns 0 (and generation 0) for an unrecognised wire
         /// version — a packet from an incompatible server is skipped safely rather than misparsed.
         /// </summary>
         public static int Decode(byte[] data, DeltaEntry[] output, out int generation)
