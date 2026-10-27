@@ -2,6 +2,8 @@
 
 Coordinated server-side performance and fluidity optimizations for Vintage Story.
 
+If you'd like to support my mods and need a server of your own, check out:
+
 <p align="center">
   <a href="https://suhosting.net/ref/ZALDARYON?to=products%2FVintage-Story%2Fvintage-story-6gb"><img src=".github/assets/suhosting-banner.png" alt="Something Unique Hosting" width="800"></a>
 </p>
