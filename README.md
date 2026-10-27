@@ -2,6 +2,10 @@
 
 Coordinated server-side performance and fluidity optimizations for Vintage Story.
 
+<p align="center">
+  <a href="https://suhosting.net/ref/ZALDARYON?to=products%2FVintage-Story%2Fvintage-story-6gb"><img src=".github/assets/suhosting-banner.png" alt="Something Unique Hosting" width="800"></a>
+</p>
+
 ## Scope
 - Side: universal (`requiredOnClient: false`, `requiredOnServer: false`)
 - Works as server-only, or with both client and server — no side is required
